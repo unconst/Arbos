@@ -204,70 +204,36 @@ fi
 
 printf "\n"
 
-# ── 6. Authenticate Cursor agent ─────────────────────────────────────────────
+# ── 6. Cursor API key ────────────────────────────────────────────────────────
 
 printf "  ${BOLD}Authentication${NC}\n\n"
 
-# Check .env for CURSOR_API_KEY first
-if [ -z "${CURSOR_API_KEY:-}" ] && [ -f "$INSTALL_DIR/.env" ]; then
-    _env_key=$(grep "^CURSOR_API_KEY=" "$INSTALL_DIR/.env" 2>/dev/null | cut -d'=' -f2- || true)
-    if [ -n "$_env_key" ]; then
-        export CURSOR_API_KEY="$_env_key"
-    fi
+# Check if CURSOR_API_KEY is already in .env
+_has_cursor_key=false
+if [ -f "$INSTALL_DIR/.env" ] && grep -q "^CURSOR_API_KEY=" "$INSTALL_DIR/.env" 2>/dev/null; then
+    _has_cursor_key=true
 fi
 
-if [ -n "${CURSOR_API_KEY:-}" ]; then
-    ok "Using CURSOR_API_KEY from environment"
-elif agent status >/dev/null 2>&1; then
-    ok "Cursor agent already authenticated"
+if [ "$_has_cursor_key" = true ]; then
+    ok "CURSOR_API_KEY already set in .env"
+elif [ -n "${CURSOR_API_KEY:-}" ]; then
+    echo "CURSOR_API_KEY=$CURSOR_API_KEY" >> "$INSTALL_DIR/.env"
+    ok "CURSOR_API_KEY saved to .env"
 else
-    printf "  ${DIM}The agent CLI needs to be logged in to work.${NC}\n\n"
-
-    # Detect if we're on a remote/headless machine (no DISPLAY, no macOS)
-    IS_REMOTE=false
-    if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ] && [ "$(uname -s)" != "Darwin" ]; then
-        IS_REMOTE=true
-    fi
-    # Also treat SSH sessions as remote
-    if [ -n "${SSH_CONNECTION:-}" ] || [ -n "${SSH_TTY:-}" ]; then
-        IS_REMOTE=true
-    fi
-
-    if [ "$IS_REMOTE" = true ]; then
-        printf "  ${CYAN}Remote machine detected${NC}\n"
-        printf "  ${DIM}A login URL will be printed below.${NC}\n"
-        printf "  ${DIM}Copy and open it in your local browser to authenticate.${NC}\n\n"
-    else
-        printf "  ${DIM}This will open your browser to authenticate.${NC}\n\n"
-    fi
+    printf "  ${DIM}Get your API key from: https://cursor.com/settings/keys${NC}\n\n"
 
     if [ "$HAS_TTY" = true ]; then
-        # NO_OPEN_BROWSER prevents agent login from trying to launch a browser
-        # (essential for remote/headless machines — it prints the URL instead)
-        if [ "$IS_REMOTE" = true ]; then
-            NO_OPEN_BROWSER=1 agent login </dev/tty 2>&1
-        else
-            agent login </dev/tty 2>&1
+        printf "  ${DIM}CURSOR_API_KEY:${NC} "
+        read -r CURSOR_API_KEY </dev/tty 2>/dev/null || CURSOR_API_KEY=""
+
+        if [ -z "$CURSOR_API_KEY" ]; then
+            die "CURSOR_API_KEY is required"
         fi
 
-        if agent status >/dev/null 2>&1; then
-            ok "Cursor agent authenticated"
-        else
-            printf "\n"
-            err "Authentication did not complete"
-            printf "  ${DIM}You can authenticate later:${NC}\n"
-            printf "  ${DIM}  Remote:  NO_OPEN_BROWSER=1 agent login${NC}\n"
-            printf "  ${DIM}  Local:   agent login${NC}\n"
-            printf "  ${DIM}  API key: export CURSOR_API_KEY=your_key${NC}\n\n"
-            die "Run 'agent login' manually and retry ./install.sh"
-        fi
+        echo "CURSOR_API_KEY=$CURSOR_API_KEY" >> "$INSTALL_DIR/.env"
+        ok "CURSOR_API_KEY saved to .env"
     else
-        err "No TTY available for interactive login"
-        printf "  ${DIM}Options:${NC}\n"
-        printf "  ${DIM}  1. Run interactively:  NO_OPEN_BROWSER=1 agent login${NC}\n"
-        printf "  ${DIM}  2. Use API key:        export CURSOR_API_KEY=your_key${NC}\n"
-        printf "  ${DIM}  Then re-run ./install.sh${NC}\n"
-        die "Authentication required — see above"
+        die "No TTY — set CURSOR_API_KEY in .env or environment and re-run"
     fi
 fi
 
