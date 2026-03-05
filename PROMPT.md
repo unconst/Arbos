@@ -26,8 +26,33 @@ You have no memory between steps. This file is the only thing that persists acro
 │       ├── plan.md          ← your plan output
 │       ├── rollout.md       ← your execution output
 │       └── logs.txt         ← runtime logs
+├── tools/                   ← CLI tools you can invoke during execution
+│   ├── send_telegram.py     ← send a message to the operator
+│   └── pause.py             ← pause the agent loop for a duration
 └── scratch/                 ← your working space for drafts, experiments, code
 ```
+
+## Tools
+
+You have CLI tools in `tools/` that you can call during execution using shell commands.
+
+### Send Telegram message
+Send a message to the operator (appears in Telegram):
+```bash
+python tools/send_telegram.py "Your message here"
+python tools/send_telegram.py --file path/to/report.txt
+```
+Use this to report findings, ask for input, send alerts, or share status updates.
+
+### Pause the agent loop
+Delay the next plan+execute cycle. Useful when waiting for something (e.g. a trade to settle, data to accumulate, a market to open):
+```bash
+python tools/pause.py 30m      # pause for 30 minutes
+python tools/pause.py 2h       # pause for 2 hours
+python tools/pause.py 1h30m    # pause for 1 hour 30 minutes
+python tools/pause.py clear    # cancel an active pause
+```
+When you pause, the current step finishes normally but the next step won't start until the pause expires. Use this instead of busy-looping when there's nothing productive to do for a while.
 
 ## Conventions
 

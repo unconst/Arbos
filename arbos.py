@@ -17,6 +17,7 @@ GOAL_FILE = WORKING_DIR / "GOAL.md"
 HISTORY_DIR = WORKING_DIR / "history"
 RESTART_FLAG = WORKING_DIR / ".restart"
 CHAT_ID_FILE = WORKING_DIR / "chat_id.txt"
+PAUSE_FILE = WORKING_DIR / ".pause_until"
 
 _agent_lock = threading.Lock()
 _loop_stop = threading.Event()
@@ -296,6 +297,27 @@ def agent_loop(bot, chat_id: int):
     consecutive_failures = 0
 
     while not _loop_stop.is_set():
+        # Check for pause file
+        if PAUSE_FILE.exists():
+            try:
+                resume_at = float(PAUSE_FILE.read_text().strip())
+                remaining = resume_at - time.time()
+                if remaining > 0:
+                    mins = remaining / 60
+                    if mins >= 60:
+                        h, m = divmod(int(mins), 60)
+                        human = f"{h}h {m}m"
+                    else:
+                        human = f"{mins:.0f}m"
+                    info(f"Paused — resuming in {human}")
+                    _loop_stop.wait(min(remaining, 30))
+                    continue
+                else:
+                    PAUSE_FILE.unlink(missing_ok=True)
+                    ok("Pause expired — resuming")
+            except (ValueError, OSError):
+                PAUSE_FILE.unlink(missing_ok=True)
+
         prompt = load_prompt()
         if not prompt:
             _loop_stop.wait(5)
