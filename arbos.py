@@ -356,7 +356,7 @@ def _build_ask_prompt(question: str) -> str:
     prompt_md = load_prompt()[:2000]
     context = _recent_context()
     return (
-        "You are answering a question about the Arbos trading agent.\n\n"
+        "You are answering a question about the Arbos agent.\n\n"
         f"System prompt:\n{prompt_md}\n\n"
         f"Recent activity:\n{context}\n\n"
         f"User question: {question}\n\n"
@@ -606,20 +606,23 @@ def run_bot():
             return
 
         full_prompt = (
-            "You are modifying the Arbos trading agent codebase.\n"
+            "You are modifying the Arbos agent codebase.\n"
             f"The user wants you to: {prompt}\n\n"
             "Make the changes directly to the code files in the project."
         )
 
-        if _agent_lock.locked():
-            bot.send_message(message.chat.id, "⏳ Waiting for current agent step to finish…")
+        def _run():
+            if _agent_lock.locked():
+                bot.send_message(message.chat.id, "⏳ Waiting for current agent step to finish…")
 
-        bot.send_message(message.chat.id, f"🔧 Adapting: {prompt[:200]}")
-        with _agent_lock:
-            run_agent_streaming(bot, full_prompt, message.chat.id, execute=True)
+            bot.send_message(message.chat.id, f"🔧 Adapting: {prompt[:200]}")
+            with _agent_lock:
+                run_agent_streaming(bot, full_prompt, message.chat.id, execute=True)
 
-        bot.send_message(message.chat.id, "✅ Code updated. Restarting…")
-        RESTART_FLAG.touch()
+            bot.send_message(message.chat.id, "✅ Code updated. Restarting…")
+            RESTART_FLAG.touch()
+
+        threading.Thread(target=_run, daemon=True).start()
 
     # ── /status — show current state ─────────────────────────────────────
 
@@ -641,21 +644,58 @@ def run_bot():
             "/start — start agent loop\n"
             "/stop — stop agent loop\n"
             "/adapt <desc> — modify code & restart\n"
+            "/logs [N] — tail last N log lines (default 50)\n"
             "/status — this message"
         ))
 
-    # ── free text — ask the agent ────────────────────────────────────────
+    # ── /logs — tail recent logs ────────────────────────────────────────
+
+    @bot.message_handler(commands=["logs"])
+    def handle_logs(message):
+        _save_chat_id(message.chat.id)
+        text = message.text.replace("/logs", "", 1).strip()
+        num_lines = 50
+        if text.isdigit():
+            num_lines = min(int(text), 200)
+
+        # Find the most recent history dir with a logs.txt
+        log_content = ""
+        if HISTORY_DIR.exists():
+            for run_dir in sorted(HISTORY_DIR.iterdir(), reverse=True):
+                log_file = run_dir / "logs.txt"
+                if log_file.exists() and log_file.stat().st_size > 0:
+                    lines = log_file.read_text().splitlines()
+                    tail = lines[-num_lines:]
+                    log_content = f"📄 {log_file}\n\n" + "\n".join(tail)
+                    break
+
+        if not log_content:
+            # Fall back to pm2 log file
+            pm2_log = WORKING_DIR / "logs" / "arbos.log"
+            if pm2_log.exists():
+                lines = pm2_log.read_text().splitlines()
+                tail = lines[-num_lines:]
+                log_content = f"📄 {pm2_log}\n\n" + "\n".join(tail)
+
+        if not log_content:
+            bot.reply_to(message, "No logs found.")
+            return
+
+        if len(log_content) > 4000:
+            log_content = log_content[-4000:]
+        bot.reply_to(message, log_content)
+
+    # ── free text — ask the agent (runs concurrently, no lock) ──────────
 
     @bot.message_handler(func=lambda m: True)
     def handle_question(message):
         _save_chat_id(message.chat.id)
         ask_prompt = _build_ask_prompt(message.text)
 
-        if _agent_lock.locked():
-            bot.send_message(message.chat.id, "⏳ Waiting for current agent step to finish…")
-
-        with _agent_lock:
+        def _run():
             run_agent_streaming(bot, ask_prompt, message.chat.id, execute=False)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     # ── start polling with auto-reconnect ────────────────────────────────
 
