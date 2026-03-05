@@ -8,6 +8,7 @@ dependencies = [
     "hyperliquid-python-sdk",
     "requests",
     "python-dotenv",
+    "pyTelegramBotAPI",
 ]
 
 [tool.setuptools]

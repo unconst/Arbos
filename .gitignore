@@ -16,3 +16,4 @@ logs/*
 .arbos-launch.sh
 .arbos.pid
 .restart
+chat_id.txt

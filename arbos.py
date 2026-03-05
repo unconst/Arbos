@@ -3,13 +3,19 @@ import os
 import subprocess
 import sys
 import time
+import threading
 from pathlib import Path
 from datetime import datetime
 
-PROMPT_FILE = Path(__file__).parent / "PROMPT.md"
+from dotenv import load_dotenv
+
 WORKING_DIR = Path(__file__).parent
+load_dotenv(WORKING_DIR / ".env")
+
+PROMPT_FILE = WORKING_DIR / "PROMPT.md"
 HISTORY_DIR = WORKING_DIR / "history"
 RESTART_FLAG = WORKING_DIR / ".restart"
+CHAT_ID_FILE = WORKING_DIR / "chat_id.txt"
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 
@@ -110,6 +116,8 @@ def _describe_tool_call(tc: dict) -> str:
         return f"{key}({arg_summary})"
     return str(list(tc.keys()))
 
+
+# ── Agent runner (console, used by the main loop) ───────────────────────────
 
 def run_agent(cmd: list[str], phase: str, output_file: Path) -> subprocess.CompletedProcess:
     stream_cmd = []
@@ -212,7 +220,6 @@ def run_step(prompt: str) -> bool:
     dim(f"run dir  {run_dir}")
     dim(f"log file {log_file}")
 
-    # ── Plan ──
     header("Planning")
 
     preview = prompt[:200] + ("…" if len(prompt) > 200 else "")
@@ -234,7 +241,6 @@ def run_step(prompt: str) -> bool:
         _log_fh = None
         return False
 
-    # ── Execute ──
     header("Execution")
 
     execute_prompt = (
@@ -268,6 +274,202 @@ def run_step(prompt: str) -> bool:
     return success
 
 
+# ── Telegram bot (runs in a background thread) ──────────────────────────────
+
+def _recent_context(max_chars: int = 6000) -> str:
+    if not HISTORY_DIR.exists():
+        return ""
+    parts: list[str] = []
+    total = 0
+    for run_dir in sorted(HISTORY_DIR.iterdir(), reverse=True):
+        if not run_dir.is_dir():
+            continue
+        for name in ("plan.md", "rollout.md"):
+            f = run_dir / name
+            if f.exists():
+                content = f.read_text()[:2000]
+                hdr = f"\n--- {name} ({run_dir.name}) ---\n"
+                if total + len(hdr) + len(content) > max_chars:
+                    return "".join(parts)
+                parts.append(hdr + content)
+                total += len(hdr) + len(content)
+        if total > max_chars:
+            break
+    return "".join(parts)
+
+
+def _build_ask_prompt(question: str) -> str:
+    prompt_md = ""
+    if PROMPT_FILE.exists():
+        prompt_md = PROMPT_FILE.read_text()[:1500]
+    context = _recent_context()
+    return (
+        "You are answering a question about the Arbos trading agent.\n\n"
+        f"System prompt:\n{prompt_md}\n\n"
+        f"Recent activity:\n{context}\n\n"
+        f"User question: {question}\n\n"
+        "Answer concisely based on available information. "
+        "If you need to check specific files (like scratch/ or history/), do so."
+    )
+
+
+def run_agent_streaming(bot, prompt: str, chat_id: int, *, execute: bool = False) -> str:
+    """Run the Cursor agent CLI and stream output into a Telegram message."""
+    cmd = [
+        "agent", "-p", "--force",
+        "--output-format", "stream-json",
+        "--stream-partial-output",
+    ]
+    if not execute:
+        cmd.extend(["--mode", "plan"])
+
+    api_key = os.environ.get("CURSOR_API_KEY")
+    if api_key:
+        cmd.insert(1, "--api-key")
+        cmd.insert(2, api_key)
+
+    cmd.append(prompt)
+
+    msg = bot.send_message(chat_id, "🤔")
+    current_text = ""
+    last_edit = 0.0
+
+    def _edit(text: str, force: bool = False):
+        nonlocal last_edit
+        now = time.time()
+        if not force and now - last_edit < 1.5:
+            return
+        display = text[-3800:] if len(text) > 3800 else text
+        if not display.strip():
+            return
+        try:
+            bot.edit_message_text(display, chat_id, msg.message_id)
+            last_edit = now
+        except Exception:
+            pass
+
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=WORKING_DIR,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
+        )
+
+        for line in iter(proc.stdout.readline, ""):
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            etype = evt.get("type")
+
+            if etype == "assistant":
+                for block in evt.get("message", {}).get("content", []):
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        t = block.get("text", "")
+                        if t:
+                            current_text += t
+
+            elif etype == "tool_call" and evt.get("subtype") == "started":
+                tc = evt.get("tool_call", {})
+                for key, val in tc.items():
+                    if isinstance(val, dict):
+                        args = val.get("args", {})
+                        if "command" in args:
+                            current_text += f"\n🔧 {args['command'][:80]}\n"
+                        elif "path" in args:
+                            current_text += f"\n🔧 {key}({args['path']})\n"
+                        break
+
+            elif etype == "result":
+                result_text = evt.get("result", "")
+                if result_text.strip():
+                    current_text += f"\n{result_text}"
+
+            _edit(current_text)
+
+        proc.wait()
+        _edit(current_text, force=True)
+
+        if not current_text.strip():
+            try:
+                bot.edit_message_text("(no output)", chat_id, msg.message_id)
+            except Exception:
+                pass
+
+    except Exception as e:
+        try:
+            bot.edit_message_text(f"Error: {str(e)[:300]}", chat_id, msg.message_id)
+        except Exception:
+            pass
+
+    return current_text
+
+
+def start_telegram_bot():
+    """Start the Telegram bot in a daemon thread. No-op if TAU_BOT_TOKEN is unset."""
+    token = os.getenv("TAU_BOT_TOKEN")
+    if not token:
+        dim("TAU_BOT_TOKEN not set — Telegram bot disabled")
+        return
+
+    import telebot
+    bot = telebot.TeleBot(token)
+
+    def _save_chat_id(chat_id: int):
+        CHAT_ID_FILE.write_text(str(chat_id))
+
+    @bot.message_handler(commands=["start"])
+    def handle_start(message):
+        _save_chat_id(message.chat.id)
+        bot.reply_to(
+            message,
+            "Connected to Arbos.\n\n"
+            "Send any message to ask about current status, PnL, strategy, etc.\n"
+            "Use /adapt <description> to modify the code.",
+        )
+
+    @bot.message_handler(commands=["adapt"])
+    def handle_adapt(message):
+        prompt = message.text.replace("/adapt", "", 1).strip()
+        if not prompt:
+            bot.reply_to(message, "Usage: /adapt <description of changes>")
+            return
+
+        _save_chat_id(message.chat.id)
+
+        full_prompt = (
+            "You are modifying the Arbos trading agent codebase.\n"
+            f"The user wants you to: {prompt}\n\n"
+            "Make the changes directly to the code files in the project."
+        )
+
+        bot.send_message(message.chat.id, f"🔧 Adapting: {prompt[:200]}")
+        run_agent_streaming(bot, full_prompt, message.chat.id, execute=True)
+
+        try:
+            RESTART_FLAG.touch()
+            subprocess.run(["pm2", "restart", "arbos"], capture_output=True, timeout=10)
+            bot.send_message(message.chat.id, "✅ Code updated, Arbos restarting…")
+        except Exception as e:
+            bot.send_message(message.chat.id, f"⚠️ Restart failed: {str(e)[:200]}")
+
+    @bot.message_handler(func=lambda m: True)
+    def handle_question(message):
+        _save_chat_id(message.chat.id)
+        prompt = _build_ask_prompt(message.text)
+        run_agent_streaming(bot, prompt, message.chat.id, execute=False)
+
+    def _run():
+        ok("Telegram bot started")
+        bot.infinity_polling()
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
 def main() -> None:
     banner()
     header("Arbos loop")
@@ -275,6 +477,8 @@ def main() -> None:
     dim(f"prompt   {PROMPT_FILE}")
     dim(f"workdir  {WORKING_DIR}")
     dim(f"history  {HISTORY_DIR}")
+
+    start_telegram_bot()
 
     loop_count = 0
     consecutive_failures = 0

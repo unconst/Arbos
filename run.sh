@@ -265,6 +265,13 @@ ask_key "COINGLASS_API_KEY" \
 
 printf "\n"
 
+ask_key "TAU_BOT_TOKEN" \
+    "Telegram bot token (optional, skip to disable)" \
+    "Create a bot via @BotFather on Telegram, then paste the token here" \
+    "optional"
+
+printf "\n"
+
 # ── 7. Start Arbos ───────────────────────────────────────────────────────────
 
 printf "  ${BOLD}Starting Arbos${NC}\n\n"
@@ -331,4 +338,6 @@ printf "  ${DIM}status${NC}   pm2 status\n"
 printf "  ${DIM}stop${NC}     pm2 stop $PM2_NAME\n"
 printf "  ${DIM}start${NC}    pm2 start $PM2_NAME\n"
 printf "  ${DIM}restart${NC}  pm2 restart $PM2_NAME\n"
+printf "\n"
+printf "  Open Telegram and send /start to your bot to connect.\n"
 printf "\n"
