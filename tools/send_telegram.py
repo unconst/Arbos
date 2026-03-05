@@ -49,6 +49,21 @@ def main():
     bot.send_message(chat_id, text)
     print(f"Sent ({len(text)} chars)")
 
+    # Log to chatlog
+    import json
+    from datetime import datetime
+    chatlog_dir = WORKING_DIR / "chatlog"
+    chatlog_dir.mkdir(exist_ok=True)
+    existing = sorted(chatlog_dir.glob("*.jsonl"))
+    current = None
+    if existing and existing[-1].stat().st_size < 4000:
+        current = existing[-1]
+    if current is None:
+        current = chatlog_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
+    entry = json.dumps({"role": "bot", "text": text[:1000], "ts": datetime.now().isoformat()})
+    with open(current, "a", encoding="utf-8") as f:
+        f.write(entry + "\n")
+
 
 if __name__ == "__main__":
     main()

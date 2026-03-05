@@ -195,7 +195,7 @@ fi
 source .venv/bin/activate
 run "Installing dependencies" uv pip install -e .
 
-mkdir -p history scratch
+mkdir -p history scratch chatlog
 
 printf "\n"
 

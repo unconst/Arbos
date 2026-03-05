@@ -13,15 +13,11 @@ WORKING_DIR = Path(__file__).parent
 load_dotenv(WORKING_DIR / ".env")
 
 PROMPT_FILE = WORKING_DIR / "PROMPT.md"
-GOAL_FILE = WORKING_DIR / "GOAL.md"
-HISTORY_DIR = WORKING_DIR / "history"
+GOALS_META = WORKING_DIR / "goals.json"
+CONTEXT_DIR = WORKING_DIR / "context"
+CHATLOG_DIR = CONTEXT_DIR / "chat"
 RESTART_FLAG = WORKING_DIR / ".restart"
 CHAT_ID_FILE = WORKING_DIR / "chat_id.txt"
-PAUSE_FILE = WORKING_DIR / ".pause_until"
-
-_agent_lock = threading.Lock()
-_loop_stop = threading.Event()
-_loop_thread: threading.Thread | None = None
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 
@@ -89,28 +85,116 @@ def fmt_duration(seconds: float) -> str:
     return f"{m}m {s}s"
 
 
+# ── Goal helpers ──────────────────────────────────────────────────────────────
+
+def goal_file(gid: str) -> Path:
+    d = CONTEXT_DIR / gid
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "GOAL.md"
+
+
+def load_goals() -> dict:
+    if GOALS_META.exists():
+        try:
+            return json.loads(GOALS_META.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_goals(data: dict):
+    GOALS_META.write_text(json.dumps(data, indent=2) + "\n")
+
+
 # ── File helpers ─────────────────────────────────────────────────────────────
 
-def load_prompt() -> str:
-    """Build full prompt from PROMPT.md + GOAL.md."""
+def load_prompt(goal_id: str | None = None) -> str:
+    """Build full prompt from PROMPT.md + GOAL-<id>.md + recent chatlog."""
     parts = []
     if PROMPT_FILE.exists():
         text = PROMPT_FILE.read_text().strip()
         if text:
             parts.append(text)
-    if GOAL_FILE.exists():
-        goal = GOAL_FILE.read_text().strip()
-        if goal:
-            parts.append(f"### Goal\n\n{goal}")
+    if goal_id:
+        gf = goal_file(goal_id)
+        parts.append(
+            f"### Active Goal: `{goal_id}`\n\n"
+            f"You are currently working on goal `{goal_id}`. "
+            f"Your goal-specific state file is `context/{goal_id}/GOAL.md` — "
+            f"edit it to leave yourself notes and context for the next step."
+        )
+        if gf.exists():
+            goal_text = gf.read_text().strip()
+            if goal_text:
+                parts.append(goal_text)
+    chatlog = load_chatlog()
+    if chatlog:
+        parts.append(chatlog)
     return "\n\n".join(parts)
 
 
-def make_run_dir() -> Path:
-    HISTORY_DIR.mkdir(exist_ok=True)
+def make_run_dir(goal_id: str) -> Path:
+    goal_dir = CONTEXT_DIR / goal_id
+    goal_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = HISTORY_DIR / ts
+    run_dir = goal_dir / ts
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
+
+
+def log_chat(role: str, text: str):
+    """Append a message to the current chatlog file. Rolls to a new file when size exceeds limit."""
+    CHATLOG_DIR.mkdir(exist_ok=True)
+    max_file_size = 4000
+    max_files = 50
+
+    existing = sorted(CHATLOG_DIR.glob("*.jsonl"))
+
+    current: Path | None = None
+    if existing and existing[-1].stat().st_size < max_file_size:
+        current = existing[-1]
+
+    if current is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        current = CHATLOG_DIR / f"{ts}.jsonl"
+
+    entry = json.dumps({"role": role, "text": text[:1000], "ts": datetime.now().isoformat()})
+    with open(current, "a", encoding="utf-8") as f:
+        f.write(entry + "\n")
+
+    # Prune old files
+    all_files = sorted(CHATLOG_DIR.glob("*.jsonl"))
+    for old in all_files[:-max_files]:
+        old.unlink(missing_ok=True)
+
+
+def load_chatlog(max_chars: int = 8000) -> str:
+    """Load recent Telegram chat history for prompt injection."""
+    if not CHATLOG_DIR.exists():
+        return ""
+    files = sorted(CHATLOG_DIR.glob("*.jsonl"))
+    if not files:
+        return ""
+
+    lines: list[str] = []
+    total = 0
+    for f in reversed(files):
+        for raw in reversed(f.read_text().strip().splitlines()):
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            entry = f"[{msg.get('ts', '?')[:16]}] {msg['role']}: {msg['text']}"
+            if total + len(entry) > max_chars:
+                lines.reverse()
+                return "## Recent Telegram chat\n\n" + "\n".join(lines)
+            lines.append(entry)
+            total += len(entry) + 1
+
+    lines.reverse()
+    if not lines:
+        return ""
+    return "## Recent Telegram chat\n\n" + "\n".join(lines)
 
 
 def _describe_tool_call(tc: dict) -> str:
@@ -221,10 +305,10 @@ def extract_text(result: subprocess.CompletedProcess) -> str:
     return output
 
 
-def run_step(prompt: str) -> bool:
+def run_step(prompt: str, goal_id: str) -> bool:
     global _log_fh
 
-    run_dir = make_run_dir()
+    run_dir = make_run_dir(goal_id)
     t0 = time.monotonic()
 
     log_file = run_dir / "logs.txt"
@@ -290,81 +374,83 @@ def run_step(prompt: str) -> bool:
     return success
 
 
-# ── Agent loop (started/stopped via Telegram) ───────────────────────────────
+# ── Agent loop (always-on, runs as daemon thread) ───────────────────────────
 
-def agent_loop(bot, chat_id: int):
-    loop_count = 0
-    consecutive_failures = 0
+def agent_loop():
+    step_count = 0
 
-    while not _loop_stop.is_set():
-        # Check for pause file
-        if PAUSE_FILE.exists():
-            try:
-                resume_at = float(PAUSE_FILE.read_text().strip())
-                remaining = resume_at - time.time()
-                if remaining > 0:
-                    mins = remaining / 60
-                    if mins >= 60:
-                        h, m = divmod(int(mins), 60)
-                        human = f"{h}h {m}m"
-                    else:
-                        human = f"{mins:.0f}m"
-                    info(f"Paused — resuming in {human}")
-                    _loop_stop.wait(min(remaining, 30))
-                    continue
-                else:
-                    PAUSE_FILE.unlink(missing_ok=True)
-                    ok("Pause expired — resuming")
-            except (ValueError, OSError):
-                PAUSE_FILE.unlink(missing_ok=True)
-
-        prompt = load_prompt()
-        if not prompt:
-            _loop_stop.wait(5)
+    while True:
+        goals = load_goals()
+        if not goals:
+            time.sleep(5)
             continue
 
-        loop_count += 1
-        header(f"Iteration {loop_count}")
+        now = time.time()
+        best_id = None
+        best_overdue = -1.0
+        min_wait = float("inf")
+
+        for gid, meta in goals.items():
+            delay = meta.get("delay", 60)
+            failures = meta.get("failures", 0)
+            effective_delay = delay + min(2 ** failures, 120) * (1 if failures else 0)
+            elapsed = now - meta.get("last_run", 0)
+            remaining = effective_delay - elapsed
+            if remaining <= 0 and elapsed > best_overdue:
+                best_id = gid
+                best_overdue = elapsed
+            elif remaining > 0:
+                min_wait = min(min_wait, remaining)
+
+        if best_id is None:
+            time.sleep(min(min_wait, 10))
+            continue
+
+        step_count += 1
+        header(f"Step {step_count}  goal={best_id}")
+
+        prompt = load_prompt(best_id)
+        if not prompt:
+            time.sleep(5)
+            continue
+
         dim(f"prompt={len(prompt)} chars")
 
-        with _agent_lock:
-            success = run_step(prompt)
+        success = run_step(prompt, best_id)
 
-        if RESTART_FLAG.exists():
-            RESTART_FLAG.unlink()
-            ok("Restart requested — exiting for pm2")
-            sys.exit(0)
-
-        if success:
-            consecutive_failures = 0
-        else:
-            consecutive_failures += 1
-            delay = min(2 ** consecutive_failures, 120)
-            err(f"Backing off for {delay}s after {consecutive_failures} consecutive failure(s)")
-            _loop_stop.wait(delay)
-
-    ok("Agent loop stopped")
-    try:
-        bot.send_message(chat_id, "⏹ Agent loop stopped.")
-    except Exception:
-        pass
+        goals = load_goals()
+        if best_id in goals:
+            goals[best_id]["last_run"] = time.time()
+            if success:
+                goals[best_id]["failures"] = 0
+            else:
+                goals[best_id]["failures"] = goals[best_id].get("failures", 0) + 1
+                err(f"Goal {best_id} failure #{goals[best_id]['failures']}")
+            save_goals(goals)
 
 
 # ── Telegram streaming agent ────────────────────────────────────────────────
 
 def _recent_context(max_chars: int = 6000) -> str:
-    if not HISTORY_DIR.exists():
+    if not CONTEXT_DIR.exists():
         return ""
+    all_runs: list[tuple[str, Path]] = []
+    for goal_dir in CONTEXT_DIR.iterdir():
+        if not goal_dir.is_dir() or goal_dir.name == "chat":
+            continue
+        for run_dir in goal_dir.iterdir():
+            if run_dir.is_dir():
+                all_runs.append((goal_dir.name, run_dir))
+    all_runs.sort(key=lambda x: x[1].name, reverse=True)
+
     parts: list[str] = []
     total = 0
-    for run_dir in sorted(HISTORY_DIR.iterdir(), reverse=True):
-        if not run_dir.is_dir():
-            continue
+    for gid, run_dir in all_runs:
         for name in ("plan.md", "rollout.md"):
             f = run_dir / name
             if f.exists():
                 content = f.read_text()[:2000]
-                hdr = f"\n--- {name} ({run_dir.name}) ---\n"
+                hdr = f"\n--- {name} (goal={gid} {run_dir.name}) ---\n"
                 if total + len(hdr) + len(content) > max_chars:
                     return "".join(parts)
                 parts.append(hdr + content)
@@ -496,48 +582,6 @@ def run_bot():
     def _save_chat_id(chat_id: int):
         CHAT_ID_FILE.write_text(str(chat_id))
 
-    def _is_loop_running() -> bool:
-        return _loop_thread is not None and _loop_thread.is_alive()
-
-    # ── /start — start the agent loop ────────────────────────────────────
-
-    @bot.message_handler(commands=["start"])
-    def handle_start(message):
-        global _loop_thread
-        _save_chat_id(message.chat.id)
-
-        if _is_loop_running():
-            bot.reply_to(message, "🟢 Already running. Use /stop first.")
-            return
-
-        prompt = load_prompt()
-        if not prompt:
-            missing = []
-            if not (PROMPT_FILE.exists() and PROMPT_FILE.read_text().strip()):
-                missing.append("/prompt <text>")
-            if not (GOAL_FILE.exists() and GOAL_FILE.read_text().strip()):
-                missing.append("/goal <text>")
-            bot.reply_to(message, "Set up first:\n" + "\n".join(f"  • {m}" for m in missing))
-            return
-
-        _loop_stop.clear()
-        _loop_thread = threading.Thread(
-            target=agent_loop, args=(bot, message.chat.id), daemon=True,
-        )
-        _loop_thread.start()
-        bot.reply_to(message, "▶️ Agent loop started.")
-
-    # ── /stop — stop the agent loop ──────────────────────────────────────
-
-    @bot.message_handler(commands=["stop"])
-    def handle_stop(message):
-        _save_chat_id(message.chat.id)
-        if not _is_loop_running():
-            bot.reply_to(message, "Not running.")
-            return
-        _loop_stop.set()
-        bot.reply_to(message, "⏹ Stopping after current step finishes…")
-
     # ── /prompt — replace PROMPT.md ──────────────────────────────────────
 
     @bot.message_handler(commands=["prompt"])
@@ -551,18 +595,74 @@ def run_bot():
         PROMPT_FILE.write_text(text)
         bot.reply_to(message, f"✅ Prompt set ({len(text)} chars)")
 
-    # ── /goal — replace GOAL.md ──────────────────────────────────────────
+    # ── /goal — manage goals ────────────────────────────────────────────
 
     @bot.message_handler(commands=["goal"])
     def handle_goal(message):
         _save_chat_id(message.chat.id)
+        log_chat("user", message.text)
         text = message.text.replace("/goal", "", 1).strip()
+        goals = load_goals()
+
         if not text:
-            current = GOAL_FILE.read_text().strip() if GOAL_FILE.exists() else "(empty)"
-            bot.reply_to(message, f"Current goal:\n\n{current[:3500]}")
+            if not goals:
+                bot.reply_to(message, "No goals.\n\nUsage: /goal <uuid> <delay_seconds> <description>")
+                return
+            lines = []
+            for gid, meta in goals.items():
+                gf = goal_file(gid)
+                preview = gf.read_text().strip()[:80] if gf.exists() else "(no file)"
+                lines.append(f"• {gid}  delay={meta.get('delay', '?')}s  {preview}")
+            bot.reply_to(message, "\n".join(lines))
             return
-        GOAL_FILE.write_text(text)
-        bot.reply_to(message, f"✅ Goal set ({len(text)} chars)")
+
+        parts = text.split(None, 2)
+        gid = parts[0]
+
+        if len(parts) == 1:
+            gf = goal_file(gid)
+            if gid not in goals and not gf.exists():
+                bot.reply_to(message, f"Goal `{gid}` not found.")
+                return
+            content = gf.read_text().strip() if gf.exists() else "(empty)"
+            meta = goals.get(gid, {})
+            bot.reply_to(message, f"Goal {gid}  delay={meta.get('delay', '?')}s\n\n{content[:3500]}")
+            return
+
+        try:
+            delay = int(parts[1])
+        except ValueError:
+            bot.reply_to(message, "Usage: /goal <uuid> <delay_seconds> <description>")
+            return
+
+        description = parts[2] if len(parts) > 2 else ""
+        goals[gid] = {"delay": delay, "last_run": goals.get(gid, {}).get("last_run", 0), "failures": 0}
+        save_goals(goals)
+        goal_file(gid).write_text(description + "\n")
+        bot.reply_to(message, f"✅ Goal `{gid}` set  delay={delay}s  ({len(description)} chars)")
+        log_chat("bot", f"Goal set: {gid} delay={delay}s {description[:200]}")
+
+    # ── /delete — remove a goal ─────────────────────────────────────────
+
+    @bot.message_handler(commands=["delete"])
+    def handle_delete(message):
+        _save_chat_id(message.chat.id)
+        log_chat("user", message.text)
+        gid = message.text.replace("/delete", "", 1).strip()
+        if not gid:
+            bot.reply_to(message, "Usage: /delete <uuid>")
+            return
+        goals = load_goals()
+        if gid not in goals:
+            bot.reply_to(message, f"Goal `{gid}` not found.")
+            return
+        goals.pop(gid)
+        save_goals(goals)
+        gf = goal_file(gid)
+        if gf.exists():
+            gf.unlink()
+        bot.reply_to(message, f"🗑 Goal `{gid}` deleted.")
+        log_chat("bot", f"Goal deleted: {gid}")
 
     # ── /env — add/update .env variable ──────────────────────────────────
 
@@ -622,6 +722,7 @@ def run_bot():
     @bot.message_handler(commands=["adapt"])
     def handle_adapt(message):
         _save_chat_id(message.chat.id)
+        log_chat("user", message.text)
         prompt = message.text.replace("/adapt", "", 1).strip()
         if not prompt:
             bot.reply_to(message, "Usage: /adapt <description of changes>")
@@ -634,12 +735,9 @@ def run_bot():
         )
 
         def _run():
-            if _agent_lock.locked():
-                bot.send_message(message.chat.id, "⏳ Waiting for current agent step to finish…")
-
             bot.send_message(message.chat.id, f"🔧 Adapting: {prompt[:200]}")
-            with _agent_lock:
-                run_agent_streaming(bot, full_prompt, message.chat.id, execute=True)
+            response = run_agent_streaming(bot, full_prompt, message.chat.id, execute=True)
+            log_chat("bot", f"Adapted: {response[:500]}")
 
             bot.send_message(message.chat.id, "✅ Code updated. Restarting…")
             RESTART_FLAG.touch()
@@ -651,22 +749,24 @@ def run_bot():
     @bot.message_handler(commands=["status"])
     def handle_status(message):
         _save_chat_id(message.chat.id)
-        running = "🟢 Running" if _is_loop_running() else "⏹ Stopped"
         prompt_ok = "✅" if (PROMPT_FILE.exists() and PROMPT_FILE.read_text().strip()) else "❌"
-        goal_ok = "✅" if (GOAL_FILE.exists() and GOAL_FILE.read_text().strip()) else "❌"
+        goals = load_goals()
+        goal_lines = []
+        for gid, meta in goals.items():
+            goal_lines.append(f"  • {gid}  delay={meta.get('delay', '?')}s")
 
         bot.reply_to(message, (
-            f"Loop: {running}\n"
             f"Prompt: {prompt_ok}\n"
-            f"Goal: {goal_ok}\n\n"
-            "Commands:\n"
+            f"Goals: {len(goals)}\n"
+            + ("\n".join(goal_lines) + "\n" if goal_lines else "")
+            + "\nCommands:\n"
             "/prompt <text> — set system prompt\n"
-            "/goal <text> — set goal\n"
+            "/goal <uuid> <delay_s> <desc> — add goal\n"
+            "/goal — list goals\n"
+            "/delete <uuid> — remove goal\n"
             "/env KEY=VALUE — set env variable\n"
-            "/start — start agent loop\n"
-            "/stop — stop agent loop\n"
             "/adapt <desc> — modify code & restart\n"
-            "/logs [N] — tail last N log lines (default 50)\n"
+            "/logs [goal] [N] — tail logs\n"
             "/status — this message"
         ))
 
@@ -676,23 +776,42 @@ def run_bot():
     def handle_logs(message):
         _save_chat_id(message.chat.id)
         text = message.text.replace("/logs", "", 1).strip()
+        parts = text.split()
+        goal_filter = None
         num_lines = 50
-        if text.isdigit():
-            num_lines = min(int(text), 200)
 
-        # Find the most recent history dir with a logs.txt
+        for p in parts:
+            if p.isdigit():
+                num_lines = min(int(p), 200)
+            else:
+                goal_filter = p
+
         log_content = ""
-        if HISTORY_DIR.exists():
-            for run_dir in sorted(HISTORY_DIR.iterdir(), reverse=True):
-                log_file = run_dir / "logs.txt"
-                if log_file.exists() and log_file.stat().st_size > 0:
-                    lines = log_file.read_text().splitlines()
-                    tail = lines[-num_lines:]
-                    log_content = f"📄 {log_file}\n\n" + "\n".join(tail)
+        if CONTEXT_DIR.exists():
+            if goal_filter:
+                search_dirs = [CONTEXT_DIR / goal_filter]
+            else:
+                search_dirs = sorted(
+                    [d for d in CONTEXT_DIR.iterdir() if d.is_dir() and d.name != "chat"],
+                    reverse=True,
+                )
+
+            for goal_dir in search_dirs:
+                if not goal_dir.is_dir():
+                    continue
+                for run_dir in sorted(goal_dir.iterdir(), reverse=True):
+                    if not run_dir.is_dir():
+                        continue
+                    log_file = run_dir / "logs.txt"
+                    if log_file.exists() and log_file.stat().st_size > 0:
+                        lines = log_file.read_text().splitlines()
+                        tail = lines[-num_lines:]
+                        log_content = f"📄 {log_file}\n\n" + "\n".join(tail)
+                        break
+                if log_content:
                     break
 
         if not log_content:
-            # Fall back to pm2 log file
             pm2_log = WORKING_DIR / "logs" / "arbos.log"
             if pm2_log.exists():
                 lines = pm2_log.read_text().splitlines()
@@ -712,10 +831,12 @@ def run_bot():
     @bot.message_handler(func=lambda m: True)
     def handle_question(message):
         _save_chat_id(message.chat.id)
+        log_chat("user", message.text)
         ask_prompt = _build_ask_prompt(message.text)
 
         def _run():
-            run_agent_streaming(bot, ask_prompt, message.chat.id, execute=False)
+            response = run_agent_streaming(bot, ask_prompt, message.chat.id, execute=False)
+            log_chat("bot", response[:1000])
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -737,19 +858,17 @@ def main() -> None:
     header("Arbos")
 
     dim(f"prompt   {PROMPT_FILE}")
-    dim(f"goal     {GOAL_FILE}")
+    dim(f"goals    {GOALS_META}")
     dim(f"workdir  {WORKING_DIR}")
-    dim(f"history  {HISTORY_DIR}")
+    dim(f"context  {CONTEXT_DIR}")
 
-    # Start bot in a background thread
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
+    threading.Thread(target=agent_loop, daemon=True).start()
+    threading.Thread(target=run_bot, daemon=True).start()
 
-    # Main thread: watch for .restart flag (touched by /adapt)
     while True:
         if RESTART_FLAG.exists():
             RESTART_FLAG.unlink()
-            ok("Restart requested — exiting for pm2 to restart with updated code")
+            ok("Restart requested — exiting for pm2")
             sys.exit(0)
         time.sleep(1)
 
