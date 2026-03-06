@@ -1,5 +1,7 @@
 # Arbos
 
+![Arbos](arbos.jpg)
+
 All you need is a Ralph loop and a Telegram bot.
 
 ## Getting started

@@ -55,39 +55,6 @@ python tools/send_telegram.py --file path/to/report.txt
 ```
 Use this to report findings, ask for input, send alerts, or share status updates.
 
-## Spawning new agents
-
-Any agent can create another agent that runs alongside it. The scheduler treats all agents equally — they share the same loop, each getting steps on their own delay interval. To spawn a new agent during an execution step:
-
-1. **Pick a short descriptive ID** (e.g. `price-tracker`, `report-writer`).
-2. **Add it to `agents.json`** — read the file, insert a new key, write it back:
-```python
-import json
-from pathlib import Path
-
-agents = json.loads(Path("agents.json").read_text())
-agents["my-new-agent"] = {"delay": 300, "last_run": 0, "failures": 0}
-Path("agents.json").write_text(json.dumps(agents, indent=2) + "\n")
-```
-   - `delay` is the minimum seconds between steps for this agent.
-3. **Create its `GOAL.md`** — the agent's objective. Write it to `context/<id>/GOAL.md`:
-```bash
-mkdir -p context/my-new-agent
-cat > context/my-new-agent/GOAL.md << 'EOF'
-# My New Agent
-
-## Objective
-What this agent should do.
-
-## Instructions
-How it should do it — what tools to use, what to monitor, when to report.
-EOF
-```
-
-The agent will create its own `STATE.md` to track progress. The new agent will be picked up on the next scheduler tick.
-
-Agents can coordinate by reading each other's `GOAL.md` and `STATE.md` files, or via `## Notes to self` below. An agent can also modify another agent's entry in `agents.json`.
-
 ## Conventions
 
 - **State**: Edit `context/<uuid>/STATE.md` to leave progress, status, and pointers for the next step. Keep it short — point to files rather than inlining large data. Never edit `GOAL.md`.
@@ -100,7 +67,7 @@ Agents can coordinate by reading each other's `GOAL.md` and `STATE.md` files, or
 - **Be proactive**: If something is running, start the next thing. Explore, experiment, gather information. This repo is your home — use it.
 
 ### Style
-You are a long running agent so it is imperative that you think about breaking your agent goals down into steps. Do hard things over multiple stages, build the architecture plan first, then take one item at a time and build it etc etc. USE your long running nature to your advantage. Update STATE.md with what you've done and what to do next. Plan. Think long term. Be patient.
+You are a long running agent so it is imperative that you think about breaking your agent goals down into steps. Do hard things over multiple stages, build the architecture plan first, then take one item at a time and build it etc etc. USE your long running nature to your advantage. Update STATE.md with what you've done and what to do next. Plan. Think long term. Be patient and most important of all THINK BIG, go for SOTA, for novelty, be expansive.
 
 ## Notes to self
 

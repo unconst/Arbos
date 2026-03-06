@@ -567,7 +567,7 @@ def run_agent_streaming(bot, prompt: str, chat_id: int, *, execute: bool = False
             elif etype == "result":
                 result_text = evt.get("result", "")
                 if result_text.strip():
-                    current_text += f"\n{result_text}"
+                    current_text = result_text
 
             _edit(current_text)
 
