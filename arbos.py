@@ -24,7 +24,7 @@ RESTART_FLAG = WORKING_DIR / ".restart"
 CHAT_ID_FILE = WORKING_DIR / "chat_id.txt"
 STEP_UPDATE_CHAR_LIMIT = 500
 STEP_SOURCE_CHAR_LIMIT = 3500
-STEP_SUMMARY_MODEL = "gpt-5.3-codex-low-fast"
+STEP_SUMMARY_MODEL = ""
 
 _log_fh = None
 _log_lock = threading.Lock()
@@ -210,8 +210,13 @@ def _generate_step_update(*, step_number: int, success: bool, run_dir: Path) -> 
         f"Logs:\n{_clip_text(logs_text, STEP_SOURCE_CHAR_LIMIT)}"
     )
 
+    summary_cmd = ["codex", "exec", "--sandbox", "read-only", "--json"]
+    if STEP_SUMMARY_MODEL:
+        summary_cmd.extend(["--model", STEP_SUMMARY_MODEL])
+    summary_cmd.append(prompt)
+
     result = run_agent(
-        ["agent", "-p", "--force", "--mode", "plan", "--model", STEP_SUMMARY_MODEL, "--output-format", "text", prompt],
+        summary_cmd,
         phase="summary",
         output_file=run_dir / "summary_output.txt",
     )
@@ -276,29 +281,17 @@ def _send_step_update(step_number: int, run_dir: Path, success: bool):
 # ── Agent runner ─────────────────────────────────────────────────────────────
 
 def run_agent(cmd: list[str], phase: str, output_file: Path) -> subprocess.CompletedProcess:
-    stream_cmd = []
-    for arg in cmd:
-        if arg == "--output-format":
-            stream_cmd.append(arg)
-            continue
-        if stream_cmd and stream_cmd[-1] == "--output-format":
-            stream_cmd.append("stream-json")
-            continue
-        stream_cmd.append(arg)
-    if "--stream-partial-output" not in stream_cmd:
-        stream_cmd.insert(-1, "--stream-partial-output")
+    env = os.environ.copy()
+    api_key = env.get("OPENAI_API_KEY")
+    if api_key:
+        env["CODEX_API_KEY"] = api_key
 
-    api_key = os.environ.get("CURSOR_API_KEY")
-    if api_key and "--api-key" not in stream_cmd:
-        stream_cmd.insert(1, "--api-key")
-        stream_cmd.insert(2, api_key)
-
-    preview = " ".join(stream_cmd[:6]) + ("…" if len(stream_cmd) > 6 else "")
+    preview = " ".join(cmd[:6]) + ("…" if len(cmd) > 6 else "")
     _log(f"{phase}: starting {preview}")
     t0 = time.monotonic()
 
     proc = subprocess.Popen(
-        stream_cmd, cwd=WORKING_DIR,
+        cmd, cwd=WORKING_DIR, env=env,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, bufsize=1,
     )
@@ -311,8 +304,11 @@ def run_agent(cmd: list[str], phase: str, output_file: Path) -> subprocess.Compl
             evt = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if evt.get("type") == "result":
-            result_text = evt.get("result", "")
+        etype = evt.get("type", "")
+        if etype == "item.completed":
+            item = evt.get("item", {})
+            if item.get("type") == "agent_message":
+                result_text = item.get("text", "")
 
     stderr_output = proc.stderr.read() if proc.stderr else ""
     returncode = proc.wait()
@@ -354,7 +350,7 @@ def run_step(prompt: str, step_number: int) -> bool:
         _log(f"prompt preview: {preview}")
 
         plan_result = run_agent(
-            ["agent", "-p", "--force", "--mode", "plan", "--output-format", "text", prompt],
+            ["codex", "exec", "--sandbox", "read-only", "--json", prompt],
             phase="plan",
             output_file=run_dir / "plan_output.txt",
         )
@@ -374,7 +370,7 @@ def run_step(prompt: str, step_number: int) -> bool:
         )
 
         exec_result = run_agent(
-            ["agent", "-p", "--force", "--output-format", "text", execute_prompt],
+            ["codex", "exec", "--full-auto", "--json", execute_prompt],
             phase="exec",
             output_file=run_dir / "exec_output.txt",
         )
@@ -495,21 +491,19 @@ def _build_operator_prompt(user_text: str) -> str:
 
 
 def run_agent_streaming(bot, prompt: str, chat_id: int, *, execute: bool = False) -> str:
-    """Run the Cursor agent CLI and stream output into a Telegram message."""
-    cmd = [
-        "agent", "-p", "--force",
-        "--output-format", "stream-json",
-        "--stream-partial-output",
-    ]
-    if not execute:
-        cmd.extend(["--mode", "plan"])
-
-    api_key = os.environ.get("CURSOR_API_KEY")
-    if api_key:
-        cmd.insert(1, "--api-key")
-        cmd.insert(2, api_key)
+    """Run the Codex CLI and stream output into a Telegram message."""
+    cmd = ["codex", "exec", "--json"]
+    if execute:
+        cmd.append("--full-auto")
+    else:
+        cmd.extend(["--sandbox", "read-only"])
 
     cmd.append(prompt)
+
+    env = os.environ.copy()
+    api_key = env.get("OPENAI_API_KEY")
+    if api_key:
+        env["CODEX_API_KEY"] = api_key
 
     msg = bot.send_message(chat_id, "Running...")
     current_text = ""
@@ -531,7 +525,7 @@ def run_agent_streaming(bot, prompt: str, chat_id: int, *, execute: bool = False
 
     try:
         proc = subprocess.Popen(
-            cmd, cwd=WORKING_DIR,
+            cmd, cwd=WORKING_DIR, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
@@ -542,19 +536,14 @@ def run_agent_streaming(bot, prompt: str, chat_id: int, *, execute: bool = False
             except json.JSONDecodeError:
                 continue
 
-            etype = evt.get("type")
+            etype = evt.get("type", "")
 
-            if etype == "assistant":
-                for block in evt.get("message", {}).get("content", []):
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        t = block.get("text", "")
-                        if t:
-                            current_text += t
-
-            elif etype == "result":
-                result_text = evt.get("result", "")
-                if result_text.strip():
-                    current_text = result_text
+            if etype == "item.completed":
+                item = evt.get("item", {})
+                if item.get("type") == "agent_message":
+                    t = item.get("text", "")
+                    if t.strip():
+                        current_text = t
 
             _edit(current_text)
 

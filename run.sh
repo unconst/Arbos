@@ -157,24 +157,27 @@ else
     command_exists uv || die "uv install failed"
 fi
 
-# Cursor CLI (agent command)
-export PATH="$HOME/.cursor/bin:$HOME/.local/bin:$PATH"
-if command_exists agent; then
-    ok "Cursor CLI (agent) already installed"
+# OpenAI Codex CLI
+if command_exists codex; then
+    ok "Codex CLI already installed"
 else
-    run "Installing Cursor CLI" bash -c "curl https://cursor.com/install -fsSL | bash"
-    export PATH="$HOME/.cursor/bin:$HOME/.local/bin:$PATH"
-    command_exists agent || die "'agent' command not found — install Cursor CLI from https://cursor.com/install"
+    if command_exists npm; then
+        run "Installing Codex CLI" npm install -g @openai/codex
+    elif command_exists brew; then
+        run "Installing Codex CLI" brew install --cask codex
+    else
+        die "npm or brew required to install Codex CLI"
+    fi
+    command_exists codex || die "'codex' command not found — install via: npm i -g @openai/codex"
 fi
 
 # PATH persistence
 SHELL_RC="$HOME/.bashrc"
 [[ -n "${ZSH_VERSION:-}" ]] && SHELL_RC="$HOME/.zshrc"
-PATHS_TO_ADD="$HOME/.cursor/bin:$HOME/.local/bin"
-if [[ ":$PATH:" != *":$HOME/.cursor/bin:"* ]] || [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-    if ! grep -q '.cursor/bin' "$SHELL_RC" 2>/dev/null; then
-        echo 'export PATH="$HOME/.cursor/bin:$HOME/.local/bin:$PATH"' >> "$SHELL_RC"
-        ok "Added ~/.cursor/bin and ~/.local/bin to PATH in $SHELL_RC"
+if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+    if ! grep -q '.local/bin' "$SHELL_RC" 2>/dev/null; then
+        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$SHELL_RC"
+        ok "Added ~/.local/bin to PATH in $SHELL_RC"
     fi
 fi
 
@@ -244,9 +247,9 @@ ask_key() {
     ok "$key_name saved"
 }
 
-ask_key "CURSOR_API_KEY" \
-    "Cursor API key" \
-    "Get yours at: https://cursor.com/settings/keys" \
+ask_key "OPENAI_API_KEY" \
+    "OpenAI API key" \
+    "Get yours at: https://platform.openai.com/api-keys" \
     "required"
 
 printf "\n"
@@ -262,15 +265,15 @@ printf "\n"
 
 printf "  ${BOLD}Starting Arbos${NC}\n\n"
 
-if ! command_exists agent; then
-    die "'agent' command not found in PATH — Cursor CLI is required"
+if ! command_exists codex; then
+    die "'codex' command not found in PATH — install via: npm i -g @openai/codex"
 fi
-ok "agent CLI found at $(which agent)"
+ok "codex CLI found at $(which codex)"
 
 LAUNCH_SCRIPT="$INSTALL_DIR/.arbos-launch.sh"
 cat > "$LAUNCH_SCRIPT" <<LAUNCH
 #!/usr/bin/env bash
-export PATH="\$HOME/.cursor/bin:\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH"
+export PATH="\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH"
 cd "$INSTALL_DIR"
 set -a; [ -f .env ] && source .env; set +a
 source .venv/bin/activate

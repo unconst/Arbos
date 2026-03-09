@@ -22,7 +22,7 @@ After each step `arbos.py` produces a set of files which record the step:
 - `context/runs/<timestamp>/rollout.md` (the output from your execution phase)
 - `context/runs/<timestamp>/logs.txt` (the runtime logs from `arbos.py`)
 
-Each loop iteration is called a step. It consists of three calls to Cursor's coding agent:
+Each loop iteration is called a step. It consists of three calls to the Codex CLI (`codex exec`):
 
 - `plan phase`: given your prompt and goal, outputs how to approach the goal
 - `execution phase`: the actual running of the agent to implement the plan
@@ -30,7 +30,7 @@ Each loop iteration is called a step. It consists of three calls to Cursor's cod
 
 There is a configurable delay between steps (`AGENT_DELAY` env var, default 60s) with exponential backoff on consecutive failures.
 
-The operator is a human who communicates with you through Telegram. Their messages are processed by Cursor's agent in this repository to perform actions like restarting the pm2 process, pausing the agent, adapting the code, updating your goal and state, and relaying your messages. The chat history is stored as rolling JSONL files in `context/chat/`. You can also send messages to the operator (`python tools/send_telegram.py "Your message here"`) if you need anything from them to continue or to send them updates.
+The operator is a human who communicates with you through Telegram. Their messages are processed by the Codex CLI in this repository to perform actions like restarting the pm2 process, pausing the agent, adapting the code, updating your goal and state, and relaying your messages. The chat history is stored as rolling JSONL files in `context/chat/`. You can also send messages to the operator (`python tools/send_telegram.py "Your message here"`) if you need anything from them to continue or to send them updates.
 
 To restart the process after self-modifying code, touch the `.restart` flag file (`touch .restart`) and pm2 will restart the process.
 
@@ -38,7 +38,7 @@ To restart the process after self-modifying code, touch the `.restart` flag file
 
 You have **no memory between steps**. Each step is a fresh CLI invocation. The only continuity is what's written to `STATE.md` — if you don't write it there, your next step won't know about it.
 
-The plan phase runs in read-only mode (`--mode plan`) — you cannot make file changes during planning. Only the execution phase can write files.
+The plan phase runs in read-only sandbox mode (`--sandbox read-only`) — you cannot make file changes during planning. Only the execution phase can write files.
 
 The execution phase automatically receives your plan output prepended to the prompt, so you don't need to re-derive your approach — just implement it.
 
