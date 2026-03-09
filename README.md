@@ -15,10 +15,13 @@ curl -fsSL https://raw.githubusercontent.com/unconst/Arbos/main/run.sh | bash
 
 ## Usage
 
-Just tell it to do things.
+Message directly.
 ```
-Using my hyper liquid key HYPER_LIQUID=**** and my COINGLASS_API_KEY=**** and my LIUM_API_KEY=**** turn yourself into a state of the art quant firm that makes me money.
+Become a SOTA quant firm that makes me money.
+Use my hyperliquid account, coinglass api, and bittensor compute.
 ```
+
+---
 
 MIT 
 
