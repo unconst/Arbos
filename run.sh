@@ -75,7 +75,7 @@ if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
 fi
 
 if [ -z "$INSTALL_DIR" ] || [ ! -f "$INSTALL_DIR/pyproject.toml" ]; then
-    INSTALL_DIR="$HOME/Arbos"
+    INSTALL_DIR="$PWD/Arbos"
 fi
 
 HAS_TTY=false
