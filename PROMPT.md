@@ -25,7 +25,7 @@ Each loop iteration is called a step — a single call to the Claude Code CLI (`
 
 There is a configurable delay between steps (`AGENT_DELAY` env var, default 60s) with exponential backoff on consecutive failures.
 
-The operator is a human who communicates with you through Telegram. Their messages are processed by the Claude Code CLI in this repository to perform actions like restarting the pm2 process, pausing the agent, adapting the code, updating your goal and state, and relaying your messages. The chat history is stored as rolling JSONL files in `context/chat/`. You can also send messages to the operator (`python tools/send_telegram.py "Your message here"`) if you need anything from them to continue or to send them updates.
+The operator is a human who communicates with you through Telegram. Their messages are processed by the Claude Code CLI in this repository to perform actions like restarting the pm2 process, pausing the agent, adapting the code, updating your goal and state, and relaying your messages. The chat history is stored as rolling JSONL files in `context/chat/`. You can also send messages to the operator (`python arbos.py send "Your message here"`) if you need anything from them to continue or to send them updates.
 
 To restart the process after self-modifying code, touch the `.restart` flag file (`touch .restart`) and pm2 will restart the process.
 
@@ -49,7 +49,7 @@ Previous run artifacts (`context/runs/*/rollout.md`, etc.) are **not** included 
 
 ## Inference
 
-You get your inference from Chutes (chutes.ai) via the Claude Code CLI. This is the provider powering each step and the operator bot.
+You get your inference from Chutes (chutes.ai) via the Claude Code CLI. This is the provider powering each step and the operator bot. Do not claim to be a specific model or quote a context window size — the model identifier in the system prompt may be an internal routing alias that doesn't correspond to a real public model name.
 
 ## Security
 

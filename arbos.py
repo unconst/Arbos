@@ -216,7 +216,6 @@ def _redact_secrets(text: str) -> str:
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub("[REDACTED]", text)
     return text
-STEP_UPDATE_CHAR_LIMIT = 500
 MAX_CONCURRENT = int(os.environ.get("CLAUDE_MAX_CONCURRENT", "4"))
 
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "moonshotai/Kimi-K2.5-TEE")
@@ -361,29 +360,6 @@ def load_chatlog(max_chars: int = 8000) -> str:
 
 # ── Step update helpers ──────────────────────────────────────────────────────
 
-def _build_step_update(
-    *,
-    step_number: int,
-    success: bool,
-    rollout_text: str,
-    logs_text: str,
-) -> str:
-    status = "success" if success else "failed"
-
-    def first_line(text: str) -> str:
-        for line in text.splitlines():
-            cleaned = line.strip().lstrip("-*0123456789. ")
-            if cleaned:
-                return cleaned
-        return ""
-
-    action = first_line(rollout_text) or first_line(logs_text) or "completed a step"
-    summary = f"Step {step_number}: {status}; {action}."
-    cleaned = " ".join(summary.split())
-    if len(cleaned) > STEP_UPDATE_CHAR_LIMIT:
-        cleaned = cleaned[: STEP_UPDATE_CHAR_LIMIT - 1].rstrip() + "…"
-    return cleaned
-
 
 def _step_update_target() -> tuple[str, str] | None:
     token = os.getenv("TAU_BOT_TOKEN")
@@ -420,44 +396,6 @@ def _send_telegram_text(text: str, *, target: tuple[str, str] | None = None) -> 
     _log("step update sent to Telegram")
     return True
 
-
-def _send_telegram_message(text: str, *, target: tuple[str, str] | None = None) -> int | None:
-    """Send a Telegram message and return the message_id, or None on failure."""
-    target = target or _step_update_target()
-    if not target:
-        return None
-    token, chat_id = target
-    text = _redact_secrets(text)
-    try:
-        response = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text[:4000]},
-            timeout=15,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data.get("result", {}).get("message_id")
-    except Exception as exc:
-        _log(f"telegram send failed: {str(exc)[:120]}")
-        return None
-
-
-def _edit_telegram_message(message_id: int, text: str, *, target: tuple[str, str] | None = None) -> bool:
-    """Edit an existing Telegram message by message_id."""
-    target = target or _step_update_target()
-    if not target:
-        return False
-    token, chat_id = target
-    text = _redact_secrets(text)
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{token}/editMessageText",
-            json={"chat_id": chat_id, "message_id": message_id, "text": text[:4000]},
-            timeout=15,
-        )
-        return True
-    except Exception:
-        return False
 
 
 # ── Chutes proxy (Anthropic Messages API → OpenAI Chat Completions) ──────────
@@ -1167,32 +1105,6 @@ def run_step(prompt: str, step_number: int) -> bool:
     with _log_lock:
         _log_fh = open(log_file, "a", encoding="utf-8")
 
-    target = _step_update_target()
-    progress_msg_id: int | None = None
-    last_progress_edit = 0.0
-    current_activity = ""
-
-    if target:
-        progress_msg_id = _send_telegram_message(
-            f"Step {step_number}: starting...", target=target,
-        )
-
-    def _update_progress(activity: str, *, force: bool = False):
-        nonlocal last_progress_edit, current_activity
-        if not progress_msg_id:
-            return
-        current_activity = activity
-        now = time.time()
-        if not force and now - last_progress_edit < 3.0:
-            return
-        elapsed = fmt_duration(time.monotonic() - t0)
-        display = f"Step {step_number} ({elapsed})\n{activity}"
-        _edit_telegram_message(progress_msg_id, display, target=target)
-        last_progress_edit = now
-
-    def _on_activity(status: str):
-        _update_progress(status)
-
     success = False
     try:
         _log(f"run dir {run_dir}")
@@ -1206,7 +1118,6 @@ def run_step(prompt: str, step_number: int) -> bool:
             _claude_cmd(prompt),
             phase="step",
             output_file=run_dir / "output.txt",
-            on_activity=_on_activity,
         )
 
         rollout_text = extract_text(result)
@@ -1222,21 +1133,6 @@ def run_step(prompt: str, step_number: int) -> bool:
             if _log_fh:
                 _log_fh.close()
                 _log_fh = None
-        try:
-            rollout_text = (run_dir / "rollout.md").read_text() if (run_dir / "rollout.md").exists() else ""
-            logs_text = (run_dir / "logs.txt").read_text() if (run_dir / "logs.txt").exists() else ""
-            summary_text = _build_step_update(
-                step_number=step_number, success=success,
-                rollout_text=rollout_text, logs_text=logs_text,
-            )
-            if progress_msg_id and target:
-                _edit_telegram_message(progress_msg_id, summary_text, target=target)
-                log_chat("bot", summary_text[:1000])
-                _log("step update sent to Telegram (edited progress message)")
-            else:
-                _send_telegram_text(summary_text, target=target)
-        except Exception as exc:
-            _log(f"step update failed: {str(exc)[:120]}")
 
 
 # ── Agent loop ───────────────────────────────────────────────────────────────
@@ -1355,7 +1251,7 @@ def _build_operator_prompt(user_text: str) -> str:
         "- **Set env variable**: write `KEY='VALUE'` lines (one per line) to `context/.env.pending`. They are picked up automatically and persisted.\n"
         "- **View logs**: read files in `context/runs/<timestamp>/` (rollout.md, logs.txt).\n"
         "- **Modify code & restart**: edit code files, then run `touch .restart`.\n"
-        "- **Send follow-up**: run `python arbos.py send \"message\"`.",
+        "- **Send follow-up**: run `python arbos.py send \"your text here\"`.",
         f"## Current goal\n{goal}",
         f"## Current state\n{state}",
     ]
