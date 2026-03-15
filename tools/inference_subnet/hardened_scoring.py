@@ -992,8 +992,8 @@ class HardenedScoringEngine:
                 if weight != 0.0:
                     log.warning(f"Miner {uid}: non-finite or subnormal weight {weight} → 0.0")
                 weight = 0.0
-            # DEBUG: trace weight factors for epoch analysis
-            log.info(
+            # Trace weight factors at debug level (info-level only at epoch end)
+            log.debug(
                 f"[WEIGHT_TRACE] Miner {uid}: net_pts={stats.net_points:.3f} "
                 f"consistency={stats.consistency_score:.3f} "
                 f"cosine_avg={stats.avg_cosine:.3f} "
