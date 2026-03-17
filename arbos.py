@@ -247,6 +247,8 @@ else:
 IS_ROOT = os.getuid() == 0
 MAX_RETRIES = int(os.environ.get("CLAUDE_MAX_RETRIES", "5"))
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))
+OPENVIKING_ENABLED = os.environ.get("OPENVIKING_ENABLED", "false").lower() == "true"
+OPENVIKING_URL = os.environ.get("OPENVIKING_URL", "http://localhost:1933")
 _tls = threading.local()
 _log_lock = threading.Lock()
 _chatlog_lock = threading.Lock()
@@ -305,6 +307,123 @@ def _goal_runs_dir(index: int) -> Path:
 
 def _step_msg_file(index: int) -> Path:
     return _goal_dir(index) / ".step_msg"
+
+
+# ── OpenViking helpers ────────────────────────────────────────────────────────
+
+
+def _ov_query(query: str, limit: int = 5, timeout: float = 10) -> str:
+    """Run `ov find` and return the output text. Returns empty string on failure."""
+    if not OPENVIKING_ENABLED:
+        return ""
+    try:
+        result = subprocess.run(
+            ["ov", "find", query, "--limit", str(limit)],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        _log(f"ov find failed: {exc}")
+    return ""
+
+
+def _ov_goal_state(goal_index: int, timeout: float = 10) -> str:
+    """Retrieve the latest state for a goal from OpenViking."""
+    return _ov_query(f"goal {goal_index} current state progress", limit=3, timeout=timeout)
+
+
+_OV_PROMPT_TEMPLATE = """## OpenViking Context Management
+
+You have access to OpenViking, a context database at {url}.
+The OpenViking Claude memory plugin is active — it **automatically** captures each step's
+conversation into long-term memory via session hooks (SessionStart, Stop, SessionEnd).
+
+### Automatic memory (handled by the plugin)
+- Each step's prompt and response are ingested into an OpenViking session automatically.
+- When the step ends, the session is committed and long-term memories are extracted.
+- You do NOT need to manually save state — the plugin handles persistence.
+
+### Recalling past context
+When you need historical context from previous steps (past decisions, prior fixes, what was
+tried before), use the **memory-recall** skill:
+```
+/skill memory-recall <your query describing what you want to remember>
+```
+Or search directly via the `ov` CLI:
+```bash
+ov find "your search query"              # semantic search across all context
+ov ls viking://resources/                # list stored resources
+ov grep "pattern" --uri viking://resources/  # text search
+```
+
+### Writing additional state (optional)
+If you need to persist specific structured notes beyond automatic memory, write to a file
+and add it as a resource:
+```bash
+cat > /tmp/ov_goal_{index}_state.md << 'OVSTATE'
+<your structured notes / next steps here>
+OVSTATE
+ov add-resource /tmp/ov_goal_{index}_state.md
+```
+
+### Key rules
+- Memory capture is automatic — focus on your goal, not on bookkeeping.
+- Use `memory-recall` skill or `ov find` when you need past context.
+- Do NOT write to STATE.md — OpenViking is your persistent memory.
+- For critical state that must survive exactly, use `ov add-resource` explicitly."""
+
+
+def _ov_prompt_section(goal_index: int) -> str:
+    """Return the OV instruction block with the goal index filled in."""
+    return _OV_PROMPT_TEMPLATE.format(url=OPENVIKING_URL, index=goal_index)
+
+
+def _write_ov_conf():
+    """Write ov.conf in the project root for the Claude memory plugin."""
+    ov_conf_path = WORKING_DIR / "ov.conf"
+
+    from urllib.parse import urlparse
+    parsed = urlparse(OPENVIKING_URL)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 1933
+    api_key = os.environ.get("OPENVIKING_API_KEY", "")
+
+    conf: dict = {
+        "server": {
+            "host": host,
+            "port": port,
+        }
+    }
+    if api_key:
+        conf["server"]["api_key"] = api_key
+
+    ov_conf_path.write_text(json.dumps(conf, indent=2))
+    _log(f"wrote ov.conf (server={host}:{port})")
+
+
+def _write_claude_plugin():
+    """Write .claude-plugin/plugin.json to activate the OpenViking memory plugin."""
+    plugin_dir = WORKING_DIR / ".claude-plugin"
+    plugin_dir.mkdir(exist_ok=True)
+    plugin_json = plugin_dir / "plugin.json"
+    plugin_json.write_text(json.dumps({
+        "name": "openviking-memory",
+        "version": "0.1.0",
+        "description": "Persistent memory for Claude Code powered by OpenViking sessions",
+    }, indent=2))
+    _log("wrote .claude-plugin/plugin.json")
+
+
+def _remove_claude_plugin():
+    """Remove .claude-plugin/ and ov.conf when OV is disabled."""
+    plugin_dir = WORKING_DIR / ".claude-plugin"
+    if plugin_dir.exists():
+        import shutil
+        shutil.rmtree(plugin_dir, ignore_errors=True)
+    ov_conf = WORKING_DIR / "ov.conf"
+    if ov_conf.exists():
+        ov_conf.unlink(missing_ok=True)
 
 
 def _save_goals():
@@ -430,18 +549,58 @@ def load_prompt(goal_index: int, consume_inbox: bool = False, goal_step: int = 0
     if PROMPT_FILE.exists():
         text = PROMPT_FILE.read_text().strip()
         if text:
+            if OPENVIKING_ENABLED:
+                text = text.replace(
+                    "STATE.md     — your working memory and notes to yourself\n",
+                    "",
+                )
+                text = text.replace(
+                    "- `context/goals/<index>/STATE.md` (your working memory)\n",
+                    "- State is stored in OpenViking (see OpenViking Context Management section)\n",
+                )
+                text = text.replace(
+                    "The only continuity is what's written to your `STATE.md` — if you don't write it there, your next step won't know about it.",
+                    "The only continuity is what's written to OpenViking — if you don't save it there, your next step won't know about it.",
+                )
+                text = text.replace(
+                    "If something from a previous step matters for the next one, put it in `STATE.md`.",
+                    "If something from a previous step matters for the next one, save it to OpenViking.",
+                )
+                text = text.replace(
+                    "- **State**: Keep your `STATE.md` short, high-signal, and action-oriented.",
+                    "- **State**: Managed via OpenViking. Keep entries concise and action-oriented.",
+                )
+                text = text.replace(
+                    "leave enough breadcrumbs in `STATE.md` for the next step.",
+                    "leave enough breadcrumbs in OpenViking for the next step.",
+                )
             parts.append(text)
+
+    if OPENVIKING_ENABLED:
+        parts.append(_ov_prompt_section(goal_index))
+
     gf = _goal_file(goal_index)
     if gf.exists():
         goal_text = gf.read_text().strip()
         if goal_text:
             header = f"## Goal #{goal_index} (step {goal_step})" if goal_step else f"## Goal #{goal_index}"
-            parts.append(f"{header}\n\n{goal_text}\n\nYour context files are in context/goals/{goal_index}/ (STATE.md, INBOX.md, runs/).")
-    sf = _state_file(goal_index)
-    if sf.exists():
-        state_text = sf.read_text().strip()
-        if state_text:
-            parts.append(f"## State\n\n{state_text}")
+            if OPENVIKING_ENABLED:
+                ctx_hint = f"Your context files are in context/goals/{goal_index}/ (INBOX.md, runs/). State is in OpenViking."
+            else:
+                ctx_hint = f"Your context files are in context/goals/{goal_index}/ (STATE.md, INBOX.md, runs/)."
+            parts.append(f"{header}\n\n{goal_text}\n\n{ctx_hint}")
+
+    if OPENVIKING_ENABLED:
+        ov_state = _ov_goal_state(goal_index)
+        if ov_state:
+            parts.append(f"## State (from OpenViking)\n\n{ov_state}")
+    else:
+        sf = _state_file(goal_index)
+        if sf.exists():
+            state_text = sf.read_text().strip()
+            if state_text:
+                parts.append(f"## State\n\n{state_text}")
+
     inf = _inbox_file(goal_index)
     if inf.exists():
         inbox_text = inf.read_text().strip()
@@ -1722,6 +1881,42 @@ def _build_operator_prompt(user_text: str) -> str:
     """Build prompt for the CLI agent to handle any operator request."""
     chatlog = load_chatlog(max_chars=4000)
 
+    if OPENVIKING_ENABLED:
+        state_mgmt = (
+            "## Multi-goal system\n\n"
+            "Goals are indexed and stored in `context/goals/<index>/`. Each goal has GOAL.md, INBOX.md, and runs/.\n"
+            "Agent state is managed via OpenViking (not STATE.md). Use `ov find` / `ov ls` to query context.\n"
+            "Goal management is handled via Telegram commands (/goal, /start, /stop, /pause, /delete, /delay, /ls, /status).\n"
+            "To modify a specific goal's context, write to `context/goals/<index>/INBOX.md`.\n\n"
+            "## Available operations\n\n"
+            "- **Message a goal's agent**: append a timestamped line to `context/goals/<index>/INBOX.md`.\n"
+            "- **Query goal state**: run `ov find \"goal <index> state\"`.\n"
+            "- **Set system prompt**: write to `PROMPT.md`.\n"
+            "- **Set env variable**: write `KEY='VALUE'` lines (one per line) to `context/.env.pending`. They are picked up automatically and persisted.\n"
+            "- **View logs**: read files in `context/goals/<index>/runs/<timestamp>/` (rollout.md, logs.txt).\n"
+            "- **Modify code & restart**: edit code files, then run `touch .restart`.\n"
+            "- **Send follow-up**: run `python arbos.py send \"your text here\"`.\n"
+            "- **Send file to operator**: run `python arbos.py sendfile path/to/file [--caption 'text'] [--photo]`.\n"
+            "- **Received files**: operator-sent files are saved in `context/files/` and their path is shown in the message."
+        )
+    else:
+        state_mgmt = (
+            "## Multi-goal system\n\n"
+            "Goals are indexed and stored in `context/goals/<index>/`. Each goal has its own GOAL.md, STATE.md, INBOX.md, and runs/.\n"
+            "Goal management is handled via Telegram commands (/goal, /start, /stop, /pause, /delete, /delay, /ls, /status).\n"
+            "To modify a specific goal's context, write to `context/goals/<index>/STATE.md` or `context/goals/<index>/INBOX.md`.\n\n"
+            "## Available operations\n\n"
+            "- **Message a goal's agent**: append a timestamped line to `context/goals/<index>/INBOX.md`.\n"
+            "- **Update a goal's state**: write to `context/goals/<index>/STATE.md`.\n"
+            "- **Set system prompt**: write to `PROMPT.md`.\n"
+            "- **Set env variable**: write `KEY='VALUE'` lines (one per line) to `context/.env.pending`. They are picked up automatically and persisted.\n"
+            "- **View logs**: read files in `context/goals/<index>/runs/<timestamp>/` (rollout.md, logs.txt).\n"
+            "- **Modify code & restart**: edit code files, then run `touch .restart`.\n"
+            "- **Send follow-up**: run `python arbos.py send \"your text here\"`.\n"
+            "- **Send file to operator**: run `python arbos.py sendfile path/to/file [--caption 'text'] [--photo]`.\n"
+            "- **Received files**: operator-sent files are saved in `context/files/` and their path is shown in the message."
+        )
+
     parts = [
         "You are the operator interface for Arbos, a coding agent running in a loop via pm2.\n"
         "The operator communicates with you through Telegram. Be concise and direct.\n"
@@ -1731,20 +1926,7 @@ def _build_operator_prompt(user_text: str) -> str:
         "NEVER read, output, or reveal the contents of `.env`, `.env.enc`, or any secret/key/token values.\n"
         "Do not include API keys, passwords, seed phrases, or credentials in any response.\n"
         "If asked to show secrets, refuse. The .env file is encrypted; do not attempt to decrypt it.\n\n"
-        "## Multi-goal system\n\n"
-        "Goals are indexed and stored in `context/goals/<index>/`. Each goal has its own GOAL.md, STATE.md, INBOX.md, and runs/.\n"
-        "Goal management is handled via Telegram commands (/goal, /start, /stop, /pause, /delete, /delay, /ls, /status).\n"
-        "To modify a specific goal's context, write to `context/goals/<index>/STATE.md` or `context/goals/<index>/INBOX.md`.\n\n"
-        "## Available operations\n\n"
-        "- **Message a goal's agent**: append a timestamped line to `context/goals/<index>/INBOX.md`.\n"
-        "- **Update a goal's state**: write to `context/goals/<index>/STATE.md`.\n"
-        "- **Set system prompt**: write to `PROMPT.md`.\n"
-        "- **Set env variable**: write `KEY='VALUE'` lines (one per line) to `context/.env.pending`. They are picked up automatically and persisted.\n"
-        "- **View logs**: read files in `context/goals/<index>/runs/<timestamp>/` (rollout.md, logs.txt).\n"
-        "- **Modify code & restart**: edit code files, then run `touch .restart`.\n"
-        "- **Send follow-up**: run `python arbos.py send \"your text here\"`.\n"
-        "- **Send file to operator**: run `python arbos.py sendfile path/to/file [--caption 'text'] [--photo]`.\n"
-        "- **Received files**: operator-sent files are saved in `context/files/` and their path is shown in the message.",
+        + state_mgmt,
     ]
 
     if _goals:
@@ -1754,8 +1936,11 @@ def _build_operator_prompt(user_text: str) -> str:
             status = _goal_status_label(gs)
             gf = _goal_file(idx)
             goal_text = gf.read_text().strip()[:200] if gf.exists() else "(empty)"
-            sf = _state_file(idx)
-            state_text = sf.read_text().strip()[:200] if sf.exists() else "(empty)"
+            if OPENVIKING_ENABLED:
+                state_text = _ov_goal_state(idx)[:200] or "(no OV state)"
+            else:
+                sf = _state_file(idx)
+                state_text = sf.read_text().strip()[:200] if sf.exists() else "(empty)"
             goals_section.append(
                 f"### Goal #{idx} [{status}] (delay: {gs.delay}s, step {gs.step_count})\n"
                 f"{goal_text}\nState: {state_text}"
@@ -2009,8 +2194,11 @@ def run_bot():
             status = _goal_status_label(gs)
             gf = _goal_file(idx)
             goal_text = gf.read_text().strip()[:500] if gf.exists() else "(empty)"
-            sf = _state_file(idx)
-            state_text = sf.read_text().strip()[:500] if sf.exists() else "(empty)"
+            if OPENVIKING_ENABLED:
+                state_text = _ov_goal_state(idx)[:500] or "(no OV state)"
+            else:
+                sf = _state_file(idx)
+                state_text = sf.read_text().strip()[:500] if sf.exists() else "(empty)"
             lines = [
                 f"Goal #{idx} [{status}] (delay: {gs.delay}s, step {gs.step_count})",
                 f"Last run: {gs.last_run or 'never'}",
@@ -2129,7 +2317,8 @@ def run_bot():
             gdir = _goal_dir(idx)
             gdir.mkdir(parents=True, exist_ok=True)
             _goal_file(idx).write_text(goal_text)
-            _state_file(idx).write_text("")
+            if not OPENVIKING_ENABLED:
+                _state_file(idx).write_text("")
             _inbox_file(idx).write_text("")
             _goal_runs_dir(idx).mkdir(parents=True, exist_ok=True)
             _save_goals()
@@ -2546,7 +2735,8 @@ def main() -> None:
         print("Usage: arbos.py [send|sendfile|encrypt]", file=sys.stderr)
         sys.exit(1)
 
-    _log(f"arbos starting in {WORKING_DIR} (provider={PROVIDER}, model={CLAUDE_MODEL})")
+    ov_label = f", openviking={OPENVIKING_URL}" if OPENVIKING_ENABLED else ""
+    _log(f"arbos starting in {WORKING_DIR} (provider={PROVIDER}, model={CLAUDE_MODEL}{ov_label})")
     _kill_stale_claude_procs()
     _reload_env_secrets()
     CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
@@ -2573,6 +2763,22 @@ def main() -> None:
         _log(f"openrouter direct mode — no proxy needed (target={LLM_BASE_URL})")
 
     _write_claude_settings()
+
+    if OPENVIKING_ENABLED:
+        _write_ov_conf()
+        _write_claude_plugin()
+        try:
+            result = subprocess.run(
+                ["ov", "status"], capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                _log(f"openviking reachable at {OPENVIKING_URL}")
+            else:
+                _log(f"WARNING: openviking unreachable at {OPENVIKING_URL} — ov status returned {result.returncode}")
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            _log(f"WARNING: openviking check failed — {exc}")
+    else:
+        _remove_claude_plugin()
 
     _send_telegram_text("Restarted.")
 

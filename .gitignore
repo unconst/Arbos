@@ -45,3 +45,8 @@ context/
 # Codex
 .codex-pool/
 .claude/settings.local.json
+
+# OpenViking (runtime-generated)
+.claude-plugin/
+ov.conf
+.openviking/

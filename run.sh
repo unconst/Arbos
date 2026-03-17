@@ -294,6 +294,160 @@ ask_key "TAU_BOT_TOKEN" \
 
 printf "\n"
 
+# ── 7.5. OpenViking context management ──────────────────────────────────────
+
+printf "  ${BOLD}Context Management${NC}\n\n"
+
+OPENVIKING_ENABLED=""
+if grep -q "^OPENVIKING_ENABLED=" "$INSTALL_DIR/.env" 2>/dev/null; then
+    OPENVIKING_ENABLED=$(grep "^OPENVIKING_ENABLED=" "$INSTALL_DIR/.env" | head -1 | cut -d= -f2 | tr -d "' \"")
+    ok "OpenViking already configured: $OPENVIKING_ENABLED"
+elif [ "$HAS_TTY" = true ]; then
+    printf "  ${DIM}OpenViking provides structured, searchable context management for your agent.${NC}\n"
+    printf "  ${DIM}When enabled it replaces flat STATE.md files with a context database.${NC}\n\n"
+    printf "    ${BOLD}1)${NC} Enable   ${DIM}— use OpenViking for persistent context${NC}\n"
+    printf "    ${BOLD}2)${NC} Disable  ${DIM}— use flat STATE.md files (default)${NC}\n\n"
+    printf "  ${CYAN}Choice [2]:${NC} "
+    read -r _ov_choice </dev/tty 2>/dev/null || _ov_choice=""
+    case "$_ov_choice" in
+        1)
+            OPENVIKING_ENABLED="true"
+            echo "OPENVIKING_ENABLED=true" >> "$INSTALL_DIR/.env"
+            ok "OpenViking enabled"
+
+            printf "\n  ${DIM}Do you have an existing OpenViking instance?${NC}\n\n"
+            printf "  ${CYAN}OpenViking URL (leave empty to set up locally):${NC} "
+            read -r _ov_url </dev/tty 2>/dev/null || _ov_url=""
+
+            if [ -n "$_ov_url" ]; then
+                echo "OPENVIKING_URL=$_ov_url" >> "$INSTALL_DIR/.env"
+                ok "OpenViking URL saved: $_ov_url"
+
+                printf "\n  ${CYAN}OpenViking API key (leave empty if none):${NC} "
+                read -r _ov_key </dev/tty 2>/dev/null || _ov_key=""
+                if [ -n "$_ov_key" ]; then
+                    echo "OPENVIKING_API_KEY=$_ov_key" >> "$INSTALL_DIR/.env"
+                    ok "OpenViking API key saved"
+                else
+                    ok "No API key (public instance)"
+                fi
+
+                run "Installing OpenViking SDK" uv pip install openviking
+
+                # Write ovcli.conf pointing at the remote instance
+                mkdir -p "$HOME/.openviking"
+                cat > "$HOME/.openviking/ovcli.conf" <<OVCLI
+{
+  "url": "$_ov_url",
+  "timeout": 60.0,
+  "output": "table"
+}
+OVCLI
+                ok "Wrote ~/.openviking/ovcli.conf"
+            else
+                # Local setup: install openviking and start server via pm2
+                _ov_url="http://localhost:1933"
+                echo "OPENVIKING_URL=$_ov_url" >> "$INSTALL_DIR/.env"
+
+                run "Installing OpenViking" uv pip install openviking
+
+                mkdir -p "$HOME/.openviking"
+
+                # Write ovcli.conf for localhost
+                cat > "$HOME/.openviking/ovcli.conf" <<OVCLI
+{
+  "url": "http://localhost:1933",
+  "timeout": 60.0,
+  "output": "table"
+}
+OVCLI
+                ok "Wrote ~/.openviking/ovcli.conf"
+
+                # Build ov.conf — need embedding + VLM config
+                printf "\n  ${DIM}Local OpenViking needs an embedding model and VLM.${NC}\n"
+                printf "  ${DIM}An OpenAI-compatible API key is recommended.${NC}\n\n"
+
+                ask_key "OPENVIKING_VLM_API_KEY" \
+                    "OpenAI API key for OpenViking VLM/embeddings" \
+                    "Used for semantic indexing. Get one at https://platform.openai.com" \
+                    "required"
+
+                _vlm_key=$(grep "^OPENVIKING_VLM_API_KEY=" "$INSTALL_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2 | tr -d "' \"")
+
+                cat > "$HOME/.openviking/ov.conf" <<OVCONF
+{
+  "storage": {
+    "workspace": "$HOME/openviking_workspace"
+  },
+  "log": {
+    "level": "INFO",
+    "output": "stdout"
+  },
+  "embedding": {
+    "dense": {
+      "api_base": "https://api.openai.com/v1",
+      "api_key": "$_vlm_key",
+      "provider": "openai",
+      "dimension": 3072,
+      "model": "text-embedding-3-large"
+    },
+    "max_concurrent": 10
+  },
+  "vlm": {
+    "api_base": "https://api.openai.com/v1",
+    "api_key": "$_vlm_key",
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "max_concurrent": 100
+  }
+}
+OVCONF
+                ok "Wrote ~/.openviking/ov.conf"
+
+                mkdir -p "$HOME/openviking_workspace"
+
+                # Start openviking-server via pm2
+                OV_LAUNCH="$HOME/.openviking/ov-launch.sh"
+                cat > "$OV_LAUNCH" <<OVLAUNCH
+#!/usr/bin/env bash
+export PATH="\$HOME/.local/bin:\$HOME/.cargo/bin:/usr/local/bin:\$PATH"
+export OPENVIKING_CONFIG_FILE="\$HOME/.openviking/ov.conf"
+export OPENVIKING_CLI_CONFIG_FILE="\$HOME/.openviking/ovcli.conf"
+cd "$INSTALL_DIR"
+source .venv/bin/activate
+exec openviking-server 2>&1
+OVLAUNCH
+                chmod +x "$OV_LAUNCH"
+
+                pm2 delete "openviking" 2>/dev/null || true
+                pm2 start "$OV_LAUNCH" \
+                    --name "openviking" \
+                    --log "$INSTALL_DIR/logs/openviking.log" \
+                    --time \
+                    --restart-delay 5000
+
+                sleep 3
+                if pm2 pid "openviking" >/dev/null 2>&1 && [ -n "$(pm2 pid "openviking")" ]; then
+                    ok "OpenViking server running on localhost:1933"
+                else
+                    err "OpenViking server may not have started — check: pm2 logs openviking"
+                fi
+            fi
+            ;;
+        *)
+            OPENVIKING_ENABLED="false"
+            echo "OPENVIKING_ENABLED=false" >> "$INSTALL_DIR/.env"
+            ok "OpenViking disabled (using STATE.md)"
+            ;;
+    esac
+else
+    OPENVIKING_ENABLED="false"
+    echo "OPENVIKING_ENABLED=false" >> "$INSTALL_DIR/.env"
+    ok "OpenViking disabled (no TTY)"
+fi
+
+printf "\n"
+
 # ── 8. Start Arbos ───────────────────────────────────────────────────────────
 
 printf "  ${BOLD}Starting Arbos${NC}\n\n"
@@ -307,6 +461,8 @@ LAUNCH_SCRIPT="$INSTALL_DIR/.arbos-launch.sh"
 cat > "$LAUNCH_SCRIPT" <<LAUNCH
 #!/usr/bin/env bash
 export PATH="\$HOME/.local/bin:\$HOME/.cargo/bin:\$HOME/.npm-global/bin:/usr/local/bin:\$PATH"
+export OPENVIKING_CONFIG_FILE="\$HOME/.openviking/ov.conf"
+export OPENVIKING_CLI_CONFIG_FILE="\$HOME/.openviking/ovcli.conf"
 cd "$INSTALL_DIR"
 set -a; [ -f .env ] && source .env; set +a
 source .venv/bin/activate
