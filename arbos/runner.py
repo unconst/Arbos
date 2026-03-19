@@ -19,15 +19,20 @@ from arbos.prompt import log_chat, format_tool_activity
 from arbos.discord_api import send_new, edit_text
 from arbos.state import (
     tls, token_lock, token_usage, claude_semaphore,
-    child_procs, child_procs_lock,
+    child_procs, child_procs_lock, channel_models,
 )
 
+# Discord message content limit (chars)
+DISCORD_MSG_LIMIT = 2000
 
-def claude_cmd(prompt: str, extra_flags: list[str] | None = None) -> list[str]:
+
+def claude_cmd(prompt: str, extra_flags: list[str] | None = None, model_override: str | None = None) -> list[str]:
     cmd = ["claude", "-p", prompt]
     if not IS_ROOT:
         cmd.append("--dangerously-skip-permissions")
     cmd.extend(["--output-format", "stream-json", "--verbose"])
+    if model_override:
+        cmd.extend(["--model", model_override])
     if extra_flags:
         cmd.extend(extra_flags)
     return cmd
@@ -314,20 +319,37 @@ def run_step(prompt: str, step_number: int, workspace: int = 0, thread_id: int =
     _last_activity = [""]
     _heartbeat_stop = threading.Event()
     _rollout_log_buf: list[str] = [""]
+    _rollout_full_buf: list[str] = [""]  # accumulated stream for Discord message
+
+    def _build_step_msg(force: bool = False) -> str:
+        """Build step message: header + status + accumulated rollout (tail to fit DISCORD_MSG_LIMIT)."""
+        elapsed_s = time.monotonic() - t0
+        inp, out = get_tokens()
+        tok = f" | {fmt_tokens(inp, out, elapsed_s)}" if (inp or out) else ""
+        status = _last_activity[0] or "working..."
+        header = f"{step_label} ({fmt_duration(elapsed_s)}{tok})\n{status}"
+        rollout = (_rollout_full_buf[0] or "").strip()
+        if not rollout:
+            return header
+        sep = "\n\n"
+        max_rollout = DISCORD_MSG_LIMIT - len(header) - len(sep)
+        if max_rollout <= 0:
+            return header[:DISCORD_MSG_LIMIT]
+        if len(rollout) <= max_rollout:
+            return header + sep + rollout
+        return header + sep + rollout[-max_rollout:]
 
     def _on_activity(status: str):
         _last_activity[0] = status
         log(f"rollout activity: {status}")
-        elapsed_s = time.monotonic() - t0
-        inp, out = get_tokens()
-        tok = f" | {fmt_tokens(inp, out, elapsed_s)}" if (inp or out) else ""
-        _edit_step_msg(f"{step_label} ({fmt_duration(elapsed_s)}{tok})\n{status}")
+        _edit_step_msg(_build_step_msg())
 
     def _on_text(text: str):
-        """Stream rollout content to PM2 logs (stdout)."""
+        """Stream rollout content to PM2 logs and accumulate for Discord message."""
         if not text:
             return
         _rollout_log_buf[0] += text
+        _rollout_full_buf[0] += text
         while "\n" in _rollout_log_buf[0]:
             line, _rollout_log_buf[0] = _rollout_log_buf[0].split("\n", 1)
             if line.strip():
@@ -335,11 +357,7 @@ def run_step(prompt: str, step_number: int, workspace: int = 0, thread_id: int =
 
     def _heartbeat():
         while not _heartbeat_stop.wait(timeout=10):
-            elapsed_s = time.monotonic() - t0
-            inp, out = get_tokens()
-            tok = f" | {fmt_tokens(inp, out, elapsed_s)}" if (inp or out) else ""
-            status = _last_activity[0] or "working..."
-            _edit_step_msg(f"{step_label} ({fmt_duration(elapsed_s)}{tok})\n{status}", force=True)
+            _edit_step_msg(_build_step_msg(), force=True)
 
     success = False
     error_info = ""
@@ -354,8 +372,9 @@ def run_step(prompt: str, step_number: int, workspace: int = 0, thread_id: int =
 
         threading.Thread(target=_heartbeat, daemon=True).start()
 
+        channel_model = channel_models.get(workspace) if workspace else None
         result = run_agent(
-            claude_cmd(prompt),
+            claude_cmd(prompt, model_override=channel_model),
             phase=f"ws{workspace}/t{thread_id}",
             output_file=run_dir / "output.txt",
             on_text=_on_text,
@@ -401,33 +420,29 @@ def run_step(prompt: str, step_number: int, workspace: int = 0, thread_id: int =
             tls.log_fh = None
         try:
             elapsed = fmt_duration(time.monotonic() - t0)
-            rollout = (run_dir / "rollout.md").read_text() if (run_dir / "rollout.md").exists() else ""
+            # Use accumulated buffer (full stream) or fallback to saved rollout
+            rollout = (_rollout_full_buf[0] or "").strip()
+            if not rollout and (run_dir / "rollout.md").exists():
+                rollout = (run_dir / "rollout.md").read_text().strip()
             status = "done" if success else "failed"
-
-            agent_text = ""
-            if smf.exists():
-                try:
-                    st = json.loads(smf.read_text())
-                    saved = st.get("text", "")
-                    prefix = f"{step_label}: starting..."
-                    if saved != prefix and not saved.startswith(f"{step_label} ("):
-                        agent_text = saved
-                except (json.JSONDecodeError, KeyError):
-                    pass
 
             elapsed_s = time.monotonic() - t0
             inp, out = get_tokens()
             tok = f" | {fmt_tokens(inp, out, elapsed_s)}" if (inp or out) else ""
-            parts = [f"{step_label} ({elapsed}, {status}{tok})"]
+            header = f"{step_label} ({elapsed}, {status}{tok})" + (" 🟩" if success else "")
+            parts = [header]
             if error_info:
                 parts.append(f"⚠ {error_info}")
-            if agent_text:
-                parts.append(agent_text)
-            if rollout.strip():
-                parts.append(rollout.strip()[:1500])
+            sep = "\n\n"
+            used = len(header) + (len(sep) + len(parts[1])) if len(parts) > 1 else len(header)
+            max_rollout = DISCORD_MSG_LIMIT - used - len(sep)
+            if rollout and max_rollout > 0:
+                parts.append(rollout[-max_rollout:] if len(rollout) > max_rollout else rollout)
             elif not success and not error_info:
                 parts.append("(no output from Claude)")
-            final = "\n\n".join(parts)
+            final = sep.join(parts)
+            if len(final) > DISCORD_MSG_LIMIT:
+                final = final[:DISCORD_MSG_LIMIT - 3] + "..."
 
             _edit_step_msg(final, force=True)
             log_chat(workspace, "bot", final[:1000])
@@ -440,7 +455,10 @@ def run_agent_streaming(channel_id: int, msg_id: int, prompt: str, workspace: in
     """Run Claude Code CLI and stream output by editing a Discord message.
     Message format matches step logs: Arbos: (41.5s | tokens | $cost)\n{activity}
     """
-    if PROVIDER == "openrouter":
+    channel_model = channel_models.get(workspace) if workspace else None
+    if channel_model:
+        cmd = claude_cmd(prompt, model_override=channel_model)
+    elif PROVIDER == "openrouter":
         cmd = claude_cmd(prompt)
     else:
         cmd = claude_cmd(prompt, extra_flags=["--model", "bot"])
@@ -457,15 +475,17 @@ def run_agent_streaming(channel_id: int, msg_id: int, prompt: str, workspace: in
     t0 = time.monotonic()
     _heartbeat_stop = threading.Event()
 
-    def _build_status_body() -> str:
-        """Same format as step logs: Arbos: (41.5s | 89.8k in / 0 out | $0.4488)\n{activity}"""
+    def _build_status_body(success: bool = False) -> str:
+        """Same format as step logs: Arbos: (41.5s | tokens)\n{accumulated rollout tail}"""
         elapsed_s = time.monotonic() - t0
         inp, out = get_tokens()
         tok = f" | {fmt_tokens(inp, out, elapsed_s)}" if (inp or out) else ""
-        status_line = f"Arbos: ({fmt_duration(elapsed_s)}{tok})"
-        status = activity_status or current_text or "working..."
-        display = (status[-1900:] if len(status) > 1900 else status).strip()
-        if display:
+        done_emoji = " 🟩" if success else ""
+        status_line = f"Arbos: ({fmt_duration(elapsed_s)}{tok}){done_emoji}"
+        body = (current_text or activity_status or "working...").strip()
+        max_body = DISCORD_MSG_LIMIT - len(status_line) - 1
+        if body and max_body > 0:
+            display = body[-max_body:] if len(body) > max_body else body
             return f"{status_line}\n{redact_secrets(display)}"
         return status_line
 
@@ -484,7 +504,7 @@ def run_agent_streaming(channel_id: int, msg_id: int, prompt: str, workspace: in
 
     def _on_text(text: str):
         nonlocal current_text
-        current_text = text
+        current_text += text
         _edit()
 
     def _on_activity(status: str):
@@ -533,14 +553,17 @@ def run_agent_streaming(channel_id: int, msg_id: int, prompt: str, workspace: in
             break
 
         _heartbeat_stop.set()
-        _edit(force=True)
+        # Final edit with success emoji when run completed successfully
+        body = _build_status_body(success=(returncode == 0))
+        edit_text(channel_id, msg_id, body)
 
         if not current_text.strip():
             stderr_snip = redact_secrets((stderr_output or "").strip())[:300]
             elapsed_s = time.monotonic() - t0
             inp, out = get_tokens()
             tok = f" | {fmt_tokens(inp, out, elapsed_s)}" if (inp or out) else ""
-            status_line = f"Arbos: ({fmt_duration(elapsed_s)}{tok})"
+            done_emoji = " 🟩" if returncode == 0 else ""
+            status_line = f"Arbos: ({fmt_duration(elapsed_s)}{tok}){done_emoji}"
             if stderr_snip:
                 edit_text(channel_id, msg_id, f"{status_line}\n(no output)\n⚠ {stderr_snip}")
             else:

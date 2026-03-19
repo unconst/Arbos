@@ -111,6 +111,7 @@ def run_bot():
                         "`/goal <name> <description>` — start a new ralph loop\n"
                         "`/bash <command>` — run a bash command in your workspace\n"
                         "`/env KEY VALUE` — safely set an environment variable\n"
+                        "`/model <name>` — set the LLM model for this channel\n"
                         "`/restart` — kill and restart the bot"
                     )
                     break
@@ -272,6 +273,7 @@ def run_bot():
                 "`/unpause` -> restart this loop\n"
                 "`/force` -> force run this loop\n"
                 "`/delay <minutes>` -> add a delay between steps\n"
+                "`/model <name>` -> set LLM model for this channel\n"
                 "`/delete`"
             )
             await interaction.followup.send(f"Thread **{name}** created and started: {summary}")
@@ -346,6 +348,28 @@ def run_bot():
             gs.wake.set()
         await interaction.response.send_message("Forcing next step immediately.")
         log(f"goal forced ws={workspace} t={thread_id}")
+
+    @bot.tree.command(name="model", description="Set the LLM model for this channel (goal steps and ad-hoc runs)", guild=guild_obj)
+    @_owner_only()
+    @app_commands.describe(model_name="Model name, e.g. openai/gpt-5.4-mini")
+    async def cmd_model(interaction: discord.Interaction, model_name: str):
+        is_thread = isinstance(interaction.channel, discord.Thread)
+        workspace = interaction.channel.parent_id if is_thread else interaction.channel.id
+        ws_dir = workspace_dir(workspace)
+        meta_file = ws_dir / "workspace.json"
+        if not meta_file.exists():
+            await interaction.response.send_message("Workspace not found for this channel.", ephemeral=True)
+            return
+        try:
+            meta = json.loads(meta_file.read_text())
+            meta["model"] = model_name.strip()
+            meta_file.write_text(json.dumps(meta, indent=2))
+            state.channel_models[workspace] = meta["model"]
+        except Exception as exc:
+            await interaction.response.send_message(f"Failed to set model: {str(exc)[:200]}", ephemeral=True)
+            return
+        await interaction.response.send_message(f"Model for this channel set to `{meta['model']}`. Goal steps and ad-hoc runs will use it.")
+        log(f"channel model set ws={workspace} model={meta['model']}")
 
     @bot.tree.command(name="delay", description="Set step delay for this thread's goal", guild=guild_obj)
     @_owner_only()
@@ -506,7 +530,8 @@ def run_bot():
                 return -1, f"Error: {str(exc)[:500]}"
 
         rc, output = await asyncio.to_thread(_run_bash)
-        header = f"$ `{command}` (rc={rc})\n"
+        done_emoji = " 🟩" if rc == 0 else ""
+        header = f"$ `{command}` (rc={rc}){done_emoji}\n"
         body = f"```\n{output[:1900 - len(header)]}\n```"
         await interaction.followup.send(header + body)
         log(f"bash command: {command!r} rc={rc}")
@@ -520,6 +545,7 @@ def run_bot():
 • `/unpause` - Resume this goal
 • `/force` - Force the next step to run immediately
 • `/delay` - Set step delay (minutes)
+• `/model` - Set LLM model for this channel
 • `/delete` - Delete this goal
 • `/help` - Show this help message"""
         else:
@@ -527,6 +553,7 @@ def run_bot():
 • `/goal` - Create a new goal thread (auto-starts)
 • `/bash` - Run a bash command in the workspace
 • `/env` - Manage env vars (list / set / delete)
+• `/model` - Set LLM model for this channel
 • `/restart` - Restart arbos (pm2)
 • `/help` - Show this help message"""
         await interaction.response.send_message(help_text)

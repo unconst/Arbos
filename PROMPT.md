@@ -23,6 +23,14 @@ Commands (goal steps only):
   arbos send "message"                            — message the operator in Discord
   arbos sendfile path                             — send a file to the operator
   touch {arbos_root}/.restart                     — restart Arbos after code changes
+
+Config (env; then restart via `touch {arbos_root}/.restart`):
+  CLAUDE_MODEL — model to use (e.g. Chutes: `moonshotai/Kimi-K2.5-TEE`; OpenRouter: `anthropic/claude-opus-4.6`)
+  PROVIDER=openrouter + CLAUDE_MODEL=... — use OpenRouter instead of Chutes. Active provider/model is logged on startup (main.py).
+
+Slash commands (Discord; server owner only). **Channel** = use in the channel; **Thread** = use inside a goal thread:
+  **Channel:** `/goal` name, message — create goal thread (auto-starts) | `/bash` command — run in workspace (120s timeout) | `/env` — list; `/env KEY VALUE` set; `/env -d KEY` delete | `/restart` — restart Arbos (pm2) | `/help` — show commands
+  **Thread:** `/pause` `/unpause` — stop/resume this goal | `/force` — run next step immediately | `/delay` minutes — step interval | `/model` model_name — LLM for this channel (goal steps + ad-hoc) | `/delete` — delete this goal and thread | `/help`
 {other_workspaces_line}
 ## Conventions
 

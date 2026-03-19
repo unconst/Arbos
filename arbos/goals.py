@@ -60,6 +60,8 @@ def load_all_workspaces():
                 workspace = int(meta["discord_channel_id"])
                 state.workspace_id_to_slug[workspace] = ws_dir.name
                 state.channel_names[workspace] = meta.get("name", ws_dir.name)
+                if meta.get("model"):
+                    state.channel_models[workspace] = meta["model"]
             except (json.JSONDecodeError, KeyError, TypeError):
                 continue
         elif ws_dir.name.isdigit():

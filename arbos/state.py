@@ -76,3 +76,6 @@ channel_names: dict[int, str] = {}
 
 # Workspace dirs are keyed by slug on disk; map id -> slug for path resolution
 workspace_id_to_slug: dict[int, str] = {}
+
+# Per-channel model override for goal steps and ad-hoc runs (channel_id -> model name)
+channel_models: dict[int, str] = {}
