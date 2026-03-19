@@ -1,8 +1,7 @@
 [project]
 name = "arbos"
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
+description = "Discord-driven coding agent"
 requires-python = ">=3.10"
 dependencies = [
     "requests",
@@ -14,5 +13,8 @@ dependencies = [
     "cryptography",
 ]
 
+[project.scripts]
+arbos = "arbos.main:main"
+
 [tool.setuptools]
-py-modules = ["arbos"]
+packages = ["arbos"]

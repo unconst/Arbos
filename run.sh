@@ -317,7 +317,7 @@ export PATH="\$HOME/.local/bin:\$HOME/.cargo/bin:\$HOME/.npm-global/bin:/usr/loc
 cd "$INSTALL_DIR"
 set -a; [ -f .env ] && source .env; set +a
 source .venv/bin/activate
-exec python3 arbos.py 2>&1
+exec python3 -m arbos 2>&1
 LAUNCH
 chmod +x "$LAUNCH_SCRIPT"
 
