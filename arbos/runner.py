@@ -303,13 +303,25 @@ def run_step(prompt: str, step_number: int, workspace: int = 0, thread_id: int =
 
     _last_activity = [""]
     _heartbeat_stop = threading.Event()
+    _rollout_log_buf: list[str] = [""]
 
     def _on_activity(status: str):
         _last_activity[0] = status
+        log(f"rollout activity: {status}")
         elapsed_s = time.monotonic() - t0
         inp, out = get_tokens()
         tok = f" | {fmt_tokens(inp, out, elapsed_s)}" if (inp or out) else ""
         _edit_step_msg(f"{step_label} ({fmt_duration(elapsed_s)}{tok})\n{status}")
+
+    def _on_text(text: str):
+        """Stream rollout content to PM2 logs (stdout)."""
+        if not text:
+            return
+        _rollout_log_buf[0] += text
+        while "\n" in _rollout_log_buf[0]:
+            line, _rollout_log_buf[0] = _rollout_log_buf[0].split("\n", 1)
+            if line.strip():
+                log(redact_secrets(line))
 
     def _heartbeat():
         while not _heartbeat_stop.wait(timeout=10):
@@ -336,10 +348,13 @@ def run_step(prompt: str, step_number: int, workspace: int = 0, thread_id: int =
             claude_cmd(prompt),
             phase=f"ws{workspace}/t{thread_id}",
             output_file=run_dir / "output.txt",
+            on_text=_on_text,
             on_activity=_on_activity,
             workspace=workspace,
             thread_id=thread_id,
         )
+        if _rollout_log_buf[0].strip():
+            log(redact_secrets(_rollout_log_buf[0]))
 
         rollout_text = redact_secrets(extract_text(result))
         (run_dir / "rollout.md").write_text(rollout_text)
@@ -412,7 +427,9 @@ def run_step(prompt: str, step_number: int, workspace: int = 0, thread_id: int =
 
 
 def run_agent_streaming(channel_id: int, msg_id: int, prompt: str, workspace: int = 0, cwd: str | None = None) -> str:
-    """Run Claude Code CLI and stream output by editing a Discord message."""
+    """Run Claude Code CLI and stream output by editing a Discord message.
+    Message format matches step logs: Arbos: (41.5s | tokens | $cost)\n{activity}
+    """
     if PROVIDER == "openrouter":
         cmd = claude_cmd(prompt)
     else:
@@ -420,45 +437,52 @@ def run_agent_streaming(channel_id: int, msg_id: int, prompt: str, workspace: in
 
     if cwd is None:
         cwd = str(workspace_dir(workspace)) if workspace else None
+    reset_tokens()
     current_text = ""
     activity_status = ""
     last_edit_ts = 0.0
     t0 = time.monotonic()
     _heartbeat_stop = threading.Event()
 
-    def _edit(text: str, force: bool = False):
+    def _build_status_body() -> str:
+        """Same format as step logs: Arbos: (41.5s | 89.8k in / 0 out | $0.4488)\n{activity}"""
+        elapsed_s = time.monotonic() - t0
+        inp, out = get_tokens()
+        tok = f" | {fmt_tokens(inp, out, elapsed_s)}" if (inp or out) else ""
+        status_line = f"Arbos: ({fmt_duration(elapsed_s)}{tok})"
+        status = activity_status or current_text or "working..."
+        display = (status[-1900:] if len(status) > 1900 else status).strip()
+        if display:
+            return f"{status_line}\n{redact_secrets(display)}"
+        return status_line
+
+    def _edit(force: bool = False):
         nonlocal last_edit_ts
         now = time.time()
-        if not force and now - last_edit_ts < 1.5:
+        if not force and now - last_edit_ts < 1.0:
             return
-        elapsed_s = int(time.monotonic() - t0)
-        header = f"`({elapsed_s}s)`\n"
-        display = text[-1900:] if len(text) > 1900 else text
-        display = redact_secrets(display)
-        if not display.strip():
-            return
-        edit_text(channel_id, msg_id, header + display)
+        body = _build_status_body()
+        edit_text(channel_id, msg_id, body)
         last_edit_ts = now
 
     def _heartbeat():
-        while not _heartbeat_stop.wait(timeout=3):
-            if current_text or activity_status:
-                _edit(current_text or activity_status, force=True)
+        while not _heartbeat_stop.wait(timeout=1):
+            _edit(force=True)
 
     def _on_text(text: str):
         nonlocal current_text
         current_text = text
-        _edit(text)
+        _edit()
 
     def _on_activity(status: str):
         nonlocal activity_status
         activity_status = status
-        if not current_text:
-            _edit(status)
+        _edit()
 
     claude_semaphore.acquire()
     heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
     heartbeat_thread.start()
+    _edit(force=True)
     try:
         env = claude_env(workspace=workspace)
 
@@ -480,7 +504,8 @@ def run_agent_streaming(channel_id: int, msg_id: int, prompt: str, workspace: in
                 if attempt < MAX_RETRIES:
                     delay = min(2 ** attempt, 30)
                     err_detail = f": {stderr_snip}" if stderr_snip else ""
-                    _edit(f"⚠ Error (rc={returncode}{err_detail}), retrying in {delay}s... (attempt {attempt}/{MAX_RETRIES})", force=True)
+                    activity_status = f"⚠ Error (rc={returncode}{err_detail}), retrying in {delay}s... (attempt {attempt}/{MAX_RETRIES})"
+                    _edit(force=True)
                     time.sleep(delay)
                     continue
                 else:
@@ -488,20 +513,26 @@ def run_agent_streaming(channel_id: int, msg_id: int, prompt: str, workspace: in
             break
 
         _heartbeat_stop.set()
-        _edit(current_text, force=True)
+        _edit(force=True)
 
         if not current_text.strip():
             stderr_snip = redact_secrets((stderr_output or "").strip())[:300]
-            elapsed_s = int(time.monotonic() - t0)
-            header = f"`({elapsed_s}s)`\n"
+            elapsed_s = time.monotonic() - t0
+            inp, out = get_tokens()
+            tok = f" | {fmt_tokens(inp, out, elapsed_s)}" if (inp or out) else ""
+            status_line = f"Arbos: ({fmt_duration(elapsed_s)}{tok})"
             if stderr_snip:
-                edit_text(channel_id, msg_id, header + f"(no output)\n⚠ {stderr_snip}")
+                edit_text(channel_id, msg_id, f"{status_line}\n(no output)\n⚠ {stderr_snip}")
             else:
-                edit_text(channel_id, msg_id, header + "(no output)")
+                edit_text(channel_id, msg_id, f"{status_line}\n(no output)")
 
     except Exception as e:
         _heartbeat_stop.set()
-        edit_text(channel_id, msg_id, f"Error: {str(e)[:300]}")
+        elapsed_s = time.monotonic() - t0
+        inp, out = get_tokens()
+        tok = f" | {fmt_tokens(inp, out, elapsed_s)}" if (inp or out) else ""
+        status_line = f"Arbos: ({fmt_duration(elapsed_s)}{tok})"
+        edit_text(channel_id, msg_id, f"{status_line}\nError: {str(e)[:300]}")
     finally:
         _heartbeat_stop.set()
         claude_semaphore.release()

@@ -373,3 +373,5 @@ printf "    • /ls to list goals\n"
 printf "    • /status for details\n"
 printf "    • Send messages in threads to talk to the agent\n"
 printf "\n"
+
+exec pm2 logs "$PM2_NAME"

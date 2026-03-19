@@ -77,6 +77,7 @@ def run_bot():
                 return
             for ch in guild.text_channels:
                 workspace_dir(ch.id).mkdir(parents=True, exist_ok=True)
+                state.channel_names[ch.id] = ch.name
             log(f"ensured workspace dirs for {len(guild.text_channels)} channel(s)")
             for ch in guild.text_channels:
                 if ch.name == "general":
@@ -232,7 +233,7 @@ def run_bot():
                 save_goals(workspace)
 
             await thread.send(
-                f"**Goal created**: {summary}\n\n{message}\n\n"
+                f"{interaction.user.mention} **Goal created**: {summary}\n\n{message}\n\n"
                 "Messages here go to the goal's inbox. @mention me to chat directly.\n"
                 "`/pause` · `/unpause` · `/force` · `/delay <minutes>` · `/delete`"
             )

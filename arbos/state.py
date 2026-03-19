@@ -59,3 +59,6 @@ DISCORD_ASYNC_MAX_FAILURES: int = 3
 
 # Workspaces: {channel_id: {thread_id: GoalState}}
 workspaces: dict[int, dict[int, GoalState]] = {}
+
+# Channel names: {channel_id: human-readable name}
+channel_names: dict[int, str] = {}
