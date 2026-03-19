@@ -20,7 +20,7 @@ Arbos is a Python package (`arbos/`). Key modules:
 ## Log review tasks
 
 For health checks and log reviews, focus on:
-- `context/workspaces/*/goals.json` — active goals and their state
-- `context/workspaces/*/goals/*/STATE.md` — per-goal state
-- `context/workspaces/*/goals/*/runs/` — recent run logs and rollouts
-- `context/workspaces/*/chat/` — workspace chat history (JSONL)
+- `context/workspace/*/goals.json` — active goals and their state
+- `context/workspace/*/goals/*/STATE.md` — per-goal state
+- `context/logs/runs/*/*/` — recent run logs and rollouts
+- `context/logs/chat/*/` — workspace chat history (JSONL)

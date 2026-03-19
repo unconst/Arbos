@@ -9,11 +9,22 @@ from typing import Any
 from arbos.config import MAX_CONCURRENT
 
 
+def slugify(name: str) -> str:
+    """Human-readable slug for paths: lowercase, spaces/dots to hyphens, drop non-alphanumeric."""
+    if not name:
+        return ""
+    s = name.lower().strip()
+    s = "".join(c if c.isalnum() or c in " -_" else "" for c in s)
+    s = "-".join(s.split()).strip("-")
+    return s or "unnamed"
+
+
 @dataclass
 class GoalState:
     thread_id: int
     workspace: int
     thread_name: str = ""
+    thread_slug: str = ""
     summary: str = ""
     delay: int = 0
     started: bool = False
@@ -62,3 +73,6 @@ workspaces: dict[int, dict[int, GoalState]] = {}
 
 # Channel names: {channel_id: human-readable name}
 channel_names: dict[int, str] = {}
+
+# Workspace dirs are keyed by slug on disk; map id -> slug for path resolution
+workspace_id_to_slug: dict[int, str] = {}

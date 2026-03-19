@@ -12,7 +12,7 @@ init_env()
 WORKING_DIR = Path(__file__).resolve().parent.parent
 PROMPT_FILE = WORKING_DIR / "PROMPT.md"
 CONTEXT_DIR = WORKING_DIR / "context"
-WORKSPACES_DIR = CONTEXT_DIR / "workspaces"
+WORKSPACES_DIR = CONTEXT_DIR / "workspace"
 RESTART_FLAG = WORKING_DIR / ".restart"
 ENV_ENC_FILE = WORKING_DIR / ".env.enc"
 
@@ -50,13 +50,26 @@ DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 DISCORD_GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", "0"))
 IS_ROOT = os.getuid() == 0
 MAX_RETRIES = int(os.environ.get("CLAUDE_MAX_RETRIES", "5"))
-CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))
+CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "1200"))
 
-# ── Workspace path helpers ───────────────────────────────────────────────────
+# ── Workspace path helpers (slug when available, else numeric id) ─────────────
+# Lazy import state to avoid circular dependency; path resolution uses
+# workspace_id_to_slug and GoalState.thread_slug for human-readable dirs.
+
+
+def _ws_slug(workspace: int) -> str:
+    from arbos import state
+    return state.workspace_id_to_slug.get(workspace) or str(workspace)
+
+
+def _thread_slug(workspace: int, thread_id: int) -> str:
+    from arbos import state
+    gs = state.workspaces.get(workspace, {}).get(thread_id)
+    return (gs.thread_slug if gs else None) or str(thread_id)
 
 
 def workspace_dir(workspace: int) -> Path:
-    return WORKSPACES_DIR / str(workspace)
+    return WORKSPACES_DIR / _ws_slug(workspace)
 
 
 def goals_dir(workspace: int) -> Path:
@@ -68,7 +81,7 @@ def goals_json(workspace: int) -> Path:
 
 
 def chatlog_dir(workspace: int) -> Path:
-    return workspace_dir(workspace) / "chat"
+    return CONTEXT_DIR / "logs" / "chat" / _ws_slug(workspace)
 
 
 def files_dir(workspace: int) -> Path:
@@ -76,7 +89,7 @@ def files_dir(workspace: int) -> Path:
 
 
 def goal_dir(workspace: int, thread_id: int) -> Path:
-    return goals_dir(workspace) / str(thread_id)
+    return goals_dir(workspace) / _thread_slug(workspace, thread_id)
 
 
 def goal_file(workspace: int, thread_id: int) -> Path:
@@ -92,7 +105,7 @@ def inbox_file(workspace: int, thread_id: int) -> Path:
 
 
 def goal_runs_dir(workspace: int, thread_id: int) -> Path:
-    return goal_dir(workspace, thread_id) / "runs"
+    return CONTEXT_DIR / "logs" / "runs" / _ws_slug(workspace) / _thread_slug(workspace, thread_id)
 
 
 def step_msg_file(workspace: int, thread_id: int) -> Path:

@@ -10,7 +10,7 @@ from arbos.config import (
 )
 from arbos.log import log
 from arbos.redact import redact_secrets
-from arbos.state import workspaces, chatlog_lock, goals_lock
+from arbos.state import workspaces, chatlog_lock, goals_lock, channel_names
 
 
 def goal_status_label(gs) -> str:
@@ -37,9 +37,10 @@ def sibling_summary(workspace: int, thread_id: int, max_chars: int = 2000) -> st
         goal_text = gf.read_text().strip()[:200] if gf.exists() else "(empty)"
         sf = state_file(workspace, tid)
         state_text = sf.read_text().strip()[:200] if sf.exists() else "(empty)"
+        slug = gs.thread_slug or str(tid)
         entry = (
             f"### {gs.thread_name or tid} [{status}] (step {gs.step_count})\n"
-            f"`goals/{tid}/`\n"
+            f"`goals/{slug}/`\n"
             f"Goal: {goal_text}\n"
             f"State: {state_text}"
         )
@@ -58,13 +59,18 @@ def load_prompt(workspace: int, thread_id: int, consume_inbox: bool = False, goa
 
     ws_dir = workspace_dir(workspace)
     arbos_root = str(WORKING_DIR)
-    thread_dir = f"goals/{thread_id}"
+    gs = workspaces.get(workspace, {}).get(thread_id)
+    thread_dir = f"goals/{gs.thread_slug if gs and gs.thread_slug else thread_id}"
+    current_ws_slug = str(workspace)
+    if WORKSPACES_DIR.exists():
+        from arbos import state
+        current_ws_slug = state.workspace_id_to_slug.get(workspace, current_ws_slug)
     other_workspaces = [
         d.name for d in WORKSPACES_DIR.iterdir()
-        if d.is_dir() and d.name != str(workspace)
+        if d.is_dir() and d.name != current_ws_slug
     ] if WORKSPACES_DIR.exists() else []
     other_ws_line = (
-        f"Other workspaces: {', '.join(other_workspaces)} (in `{arbos_root}/context/workspaces/`)"
+        f"Other workspaces: {', '.join(other_workspaces)} (in `{arbos_root}/context/workspace/`)"
         if other_workspaces else ""
     )
 
@@ -213,7 +219,7 @@ def build_operator_prompt(workspace: int, user_text: str, thread_id: int = 0, is
             "This is the highest-level channel — all other workspaces and threads are subordinate to it.\n\n"
             "Your CWD is the Arbos root itself. You have full visibility and control over:\n"
             "- All Arbos source code (`arbos/`, `PROMPT.md`, `pyproject.toml`, `run.sh`, etc.)\n"
-            "- All workspace directories (`context/workspaces/<channel_id>/`)\n"
+            "- All workspace directories (`context/workspace/<workspace-slug>/`)\n"
             "- All goal threads across all workspaces\n"
             "- All configuration and environment files (never reveal secret values)\n\n"
             "You can read and edit Arbos's own code directly from here. "
@@ -231,9 +237,10 @@ def build_operator_prompt(workspace: int, user_text: str, thread_id: int = 0, is
         goal_text = gf.read_text().strip()[:500] if gf.exists() else "(empty)"
         sf = state_file(workspace, thread_id)
         state_text = sf.read_text().strip()[:500] if sf.exists() else "(empty)"
+        thread_slug = gs.thread_slug or str(thread_id)
         parts.append(
             f"## Context: inside thread\n\n"
-            f"Thread: `goals/{thread_id}/`\n\n"
+            f"Thread: `goals/{thread_slug}/`\n\n"
             f"### {gs.thread_name} [{status}] (delay: {gs.delay // 60}m, step {gs.step_count})\n"
             f"Goal:\n{goal_text}\n\nState:\n{state_text}"
         )
@@ -249,7 +256,7 @@ def build_operator_prompt(workspace: int, user_text: str, thread_id: int = 0, is
             ostate = osf.read_text().strip()[:200] if osf.exists() else "(empty)"
             other_threads.append(
                 f"### {ogs.thread_name or tid} [{ostatus}] (step {ogs.step_count})\n"
-                f"`goals/{tid}/`\n"
+                f"`goals/{ogs.thread_slug or tid}/`\n"
                 f"Goal: {ogoal}\nState: {ostate}"
             )
         if other_threads:
@@ -260,41 +267,36 @@ def build_operator_prompt(workspace: int, user_text: str, thread_id: int = 0, is
             f"This channel has no goal or state. It is the workspace.\n"
             f"Shared resources (repos, files, tools) live in CWD — visible to all threads.\n\n"
             f"Operations:\n"
-            f"- Message a thread: append to `goals/<tid>/INBOX.md`\n"
-            f"- Read/write thread state: `goals/<tid>/STATE.md`\n"
-            f"- View thread logs: `goals/<tid>/runs/<ts>/rollout.md`\n"
+            f"- Message a thread: append to `goals/<thread-slug>/INBOX.md`\n"
+            f"- Read/write thread state: `goals/<thread-slug>/STATE.md`\n"
+            f"- View thread logs: `context/logs/runs/<workspace-slug>/<thread-slug>/<ts>/rollout.md`\n"
             f"- Clone repos / create shared files: put in CWD (`.`)\n"
             f"- Set env var: write `KEY='VALUE'` to `{WORKING_DIR}/context/.env.pending`\n"
             f"- Restart after code change: `touch {WORKING_DIR}/.restart`"
         )
         if is_general:
-            # Show all workspaces and their threads
+            # Show all workspaces and their threads (by state, not filesystem)
             all_ws_sections = []
-            if WORKSPACES_DIR.exists():
-                for ws_path in sorted(WORKSPACES_DIR.iterdir()):
-                    if not ws_path.is_dir():
-                        continue
-                    try:
-                        ws_id = int(ws_path.name)
-                    except ValueError:
-                        continue
-                    ws_threads = workspaces.get(ws_id, {})
-                    ws_label = f"workspace {ws_id} (this channel)" if ws_id == workspace else f"workspace {ws_id}"
-                    if ws_threads:
-                        thread_lines = []
-                        for tid in sorted(ws_threads.keys()):
-                            gs = ws_threads[tid]
-                            status = goal_status_label(gs)
-                            gf = goal_file(ws_id, tid)
-                            goal_text = gf.read_text().strip()[:150] if gf.exists() else "(empty)"
-                            thread_lines.append(
-                                f"  - `{tid}` **{gs.thread_name or tid}** [{status}] step {gs.step_count}: {goal_text}"
-                            )
-                        all_ws_sections.append(
-                            f"### {ws_label}\n" + "\n".join(thread_lines)
+            for ws_id in sorted(workspaces.keys()):
+                ws_threads = workspaces.get(ws_id, {})
+                ws_name = channel_names.get(ws_id, str(ws_id))
+                ws_label = f"workspace **{ws_name}** (this channel)" if ws_id == workspace else f"workspace **{ws_name}**"
+                if ws_threads:
+                    thread_lines = []
+                    for tid in sorted(ws_threads.keys()):
+                        gs = ws_threads[tid]
+                        status = goal_status_label(gs)
+                        gf = goal_file(ws_id, tid)
+                        goal_text = gf.read_text().strip()[:150] if gf.exists() else "(empty)"
+                        slug = gs.thread_slug or str(tid)
+                        thread_lines.append(
+                            f"  - `{slug}` **{gs.thread_name or tid}** [{status}] step {gs.step_count}: {goal_text}"
                         )
-                    else:
-                        all_ws_sections.append(f"### {ws_label}\n  (no active threads)")
+                    all_ws_sections.append(
+                        f"### {ws_label}\n" + "\n".join(thread_lines)
+                    )
+                else:
+                    all_ws_sections.append(f"### {ws_label}\n  (no active threads)")
             if all_ws_sections:
                 parts.append("## All Workspaces\n\n" + "\n\n".join(all_ws_sections))
             else:
@@ -310,7 +312,7 @@ def build_operator_prompt(workspace: int, user_text: str, thread_id: int = 0, is
                 state_text = sf.read_text().strip()[:200] if sf.exists() else "(empty)"
                 goals_section.append(
                     f"### {gs.thread_name or tid} [{status}] (delay: {gs.delay // 60}m, step {gs.step_count})\n"
-                    f"`goals/{tid}/`\n"
+                    f"`goals/{gs.thread_slug or tid}/`\n"
                     f"Goal: {goal_text}\nState: {state_text}"
                 )
             parts.append("## Threads\n\n" + "\n\n".join(goals_section))

@@ -1,6 +1,7 @@
 """Discord bot — slash commands, message handlers, event routing."""
 
 import asyncio
+import json
 import subprocess
 import sys
 import threading
@@ -10,7 +11,7 @@ import discord
 from discord import app_commands
 
 from arbos.config import (
-    WORKING_DIR, DISCORD_BOT_TOKEN, DISCORD_GUILD_ID,
+    WORKING_DIR, DISCORD_BOT_TOKEN, DISCORD_GUILD_ID, WORKSPACES_DIR,
     workspace_dir, goal_dir, goal_file, state_file, inbox_file,
     goal_runs_dir, ENV_ENC_FILE,
 )
@@ -23,7 +24,7 @@ from arbos.discord_api import download_attachment
 from arbos.env import (
     list_env_keys, delete_env_key, save_to_encrypted_env, process_pending_env,
 )
-from arbos.state import GoalState, workspaces, goals_lock
+from arbos.state import GoalState, workspaces, goals_lock, slugify
 import arbos.state as state
 
 
@@ -34,6 +35,8 @@ def _kill_child_procs():
 
 def run_bot():
     """Run the Discord bot with slash commands and message handlers."""
+    import time
+    _start = time.monotonic()
     if not DISCORD_BOT_TOKEN:
         log("DISCORD_BOT_TOKEN not set; add it to .env and restart")
         sys.exit(1)
@@ -41,6 +44,7 @@ def run_bot():
         log("DISCORD_GUILD_ID not set; add it to .env and restart")
         sys.exit(1)
 
+    log("discord bot connecting to gateway...")
     intents = discord.Intents.default()
     intents.message_content = True
     intents.guilds = True
@@ -54,10 +58,13 @@ def run_bot():
             self.tree = app_commands.CommandTree(self)
 
         async def setup_hook(self):
+            elapsed = time.monotonic() - _start
+            log(f"discord gateway connected ({elapsed:.1f}s), syncing slash commands...")
             self.tree.copy_global_to(guild=guild_obj)
+            sync_start = time.monotonic()
             await self.tree.sync(guild=guild_obj)
+            log(f"discord slash commands synced (sync took {time.monotonic() - sync_start:.1f}s)")
             self.tree.on_error = self._on_tree_error
-            log("discord slash commands synced")
 
         async def _on_tree_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
             log(f"slash command error: {error}")
@@ -76,15 +83,35 @@ def run_bot():
             if not guild:
                 return
             for ch in guild.text_channels:
-                workspace_dir(ch.id).mkdir(parents=True, exist_ok=True)
+                slug = slugify(ch.name) or str(ch.id)
+                state.workspace_id_to_slug[ch.id] = slug
                 state.channel_names[ch.id] = ch.name
+                slug_dir = WORKSPACES_DIR / slug
+                legacy_dir = WORKSPACES_DIR / str(ch.id)
+                if legacy_dir.exists() and legacy_dir != slug_dir:
+                    if not slug_dir.exists():
+                        legacy_dir.rename(slug_dir)
+                        log(f"migrated workspace {ch.id} -> {slug}")
+                    else:
+                        log(f"workspace {slug} already exists, skipping migration of {ch.id}")
+                elif not slug_dir.exists():
+                    slug_dir.mkdir(parents=True, exist_ok=True)
+                meta_file = slug_dir / "workspace.json"
+                if not meta_file.exists():
+                    meta_file.write_text(json.dumps({
+                        "discord_channel_id": ch.id,
+                        "name": ch.name,
+                        "slug": slug,
+                    }, indent=2))
             log(f"ensured workspace dirs for {len(guild.text_channels)} channel(s)")
             for ch in guild.text_channels:
                 if ch.name == "general":
                     await ch.send(
-                        "**Arbos online.** @Arbos to give me instructions.\n\n"
-                        "`/goal <name> <description>` — start a new goal\n"
-                        "`/bash <command>` · `/env` · `/restart`"
+                        "**@Arbos is online, give me instructions.**\n\n"
+                        "`/goal <name> <description>` — start a new ralph loop\n"
+                        "`/bash <command>` — run a bash command in your workspace\n"
+                        "`/env KEY VALUE` — safely set an environment variable\n"
+                        "`/restart` — kill and restart the bot"
                     )
                     break
 
@@ -93,14 +120,21 @@ def run_bot():
                 return
             if channel.guild.id != DISCORD_GUILD_ID:
                 return
+            slug = slugify(channel.name) or str(channel.id)
+            state.workspace_id_to_slug[channel.id] = slug
+            state.channel_names[channel.id] = channel.name
             ws_dir = workspace_dir(channel.id)
             ws_dir.mkdir(parents=True, exist_ok=True)
+            meta_file = ws_dir / "workspace.json"
+            if not meta_file.exists():
+                meta_file.write_text(json.dumps({
+                    "discord_channel_id": channel.id,
+                    "name": channel.name,
+                    "slug": slug,
+                }, indent=2))
             await channel.send(
-                f"**Workspace ready.** This channel is a workspace — everything here is shared.\n\n"
-                f"Repos you clone, files you create, and data you generate all live in this workspace "
-                f"and are accessible to every goal thread.\n\n"
-                f"`/goal <name> <description>` — start a new goal\n"
-                f"@mention me to chat or give instructions."
+                f"**New workspace:** `/context/workspace/{slug}`\n\n"
+                f"`/goal <name> <description>` — start a new goal"
             )
             log(f"workspace created for channel {channel.name} ({channel.id})")
 
@@ -144,26 +178,14 @@ def run_bot():
             if not user_text.strip():
                 return
 
-            mentioned = self.user in message.mentions
-
             replied_to_content = None
-            if not mentioned and message.reference and message.reference.message_id:
+            if message.reference and message.reference.message_id:
                 try:
                     ref_msg = await message.channel.fetch_message(message.reference.message_id)
                     if ref_msg.author == self.user:
-                        mentioned = True
                         replied_to_content = ref_msg.content
                 except discord.NotFound:
                     pass
-
-            if not mentioned:
-                if is_thread and thread_id:
-                    inf = inbox_file(workspace, thread_id)
-                    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                    entry = f"\n[{timestamp}] {message.author.display_name}: {user_text}\n"
-                    existing = inf.read_text() if inf.exists() else ""
-                    inf.write_text(existing + entry)
-                return
 
             if replied_to_content:
                 user_text = f"[Replying to Arbos message: \"{replied_to_content[:1000]}\"]\n\n{user_text}"
@@ -178,7 +200,10 @@ def run_bot():
             _agent_cwd = str(WORKING_DIR) if is_general else None
 
             def _run():
-                response = run_agent_streaming(message.channel.id, thinking_msg.id, prompt, workspace=workspace, cwd=_agent_cwd)
+                response = run_agent_streaming(
+                    message.channel.id, thinking_msg.id, prompt,
+                    workspace=workspace, thread_id=thread_id, cwd=_agent_cwd,
+                )
                 log_chat(workspace, "bot", response[:1000])
                 if process_pending_env():
                     reload_env_secrets()
@@ -217,11 +242,19 @@ def run_bot():
 
             summary = await asyncio.to_thread(summarize_goal, message)
 
+            thread_slug = slugify(name) or str(thread_id)
             with goals_lock:
                 ws = workspaces.setdefault(workspace, {})
+                existing_slugs = {gs.thread_slug for gs in ws.values()}
+                if thread_slug in existing_slugs:
+                    n = 2
+                    while f"{thread_slug}-{n}" in existing_slugs:
+                        n += 1
+                    thread_slug = f"{thread_slug}-{n}"
                 gs = GoalState(
                     thread_id=thread_id, workspace=workspace,
-                    thread_name=name, summary=summary, started=True,
+                    thread_name=name, thread_slug=thread_slug,
+                    summary=summary, started=True,
                 )
                 ws[thread_id] = gs
                 gdir = goal_dir(workspace, thread_id)
@@ -233,9 +266,13 @@ def run_bot():
                 save_goals(workspace)
 
             await thread.send(
-                f"{interaction.user.mention} **Goal created**: {summary}\n\n{message}\n\n"
-                "Messages here go to the goal's inbox. @mention me to chat directly.\n"
-                "`/pause` · `/unpause` · `/force` · `/delay <minutes>` · `/delete`"
+                f"{interaction.user.mention} **Goal created**:\n\n{message}\n\n"
+                "**Commands**\n"
+                "`/pause` -> stop this loop\n"
+                "`/unpause` -> restart this loop\n"
+                "`/force` -> force run this loop\n"
+                "`/delay <minutes>` -> add a delay between steps\n"
+                "`/delete`"
             )
             await interaction.followup.send(f"Thread **{name}** created and started: {summary}")
             log(f"goal created ws={workspace} t={thread_id}: {summary}")
@@ -348,6 +385,7 @@ def run_bot():
             if not gs:
                 await interaction.response.send_message("No goal found for this thread.", ephemeral=True)
                 return
+            gdir = goal_dir(workspace, thread_id)
             gs.stop_event.set()
             gs.wake.set()
             gs.started = False
@@ -357,7 +395,6 @@ def run_bot():
         if bg_thread and bg_thread.is_alive():
             bg_thread.join(timeout=5)
         import shutil
-        gdir = goal_dir(workspace, thread_id)
         if gdir.exists():
             shutil.rmtree(gdir, ignore_errors=True)
         await interaction.response.send_message(f"Goal deleted. Removing thread...")

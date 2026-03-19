@@ -15,6 +15,8 @@ Sibling threads: `goals/*/` — other goals in this workspace (read their files 
 Chat log: `chat/` — workspace-wide Discord chat history (JSONL)
 Uploaded files: `files/` — files sent by the operator
 
+All persistent runtime data lives under `context/`: workspaces (with human-readable slugs), workspace chat, and **logs** (`context/logs/` — e.g. arbos.log). Goal runs stay under each workspace's `goals/<thread-slug>/runs/`.
+
 Anything you create in CWD (repos, data, scripts) is shared with all threads.
 
 Commands (goal steps only):

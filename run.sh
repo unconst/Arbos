@@ -196,7 +196,7 @@ fi
 source .venv/bin/activate
 run "Installing dependencies" uv pip install -e .
 
-mkdir -p context/runs context/chat
+mkdir -p context/runs context/chat context/logs
 
 printf "\n"
 
@@ -344,7 +344,7 @@ pm2 delete "$PM2_NAME" 2>/dev/null || true
 pm2 start "$LAUNCH_SCRIPT" \
     --name "$PM2_NAME" \
     --cwd "$INSTALL_DIR" \
-    --log "$INSTALL_DIR/logs/arbos.log" \
+    --log "$INSTALL_DIR/context/logs/arbos.log" \
     --time \
     --restart-delay 10000
 

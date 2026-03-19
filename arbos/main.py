@@ -81,6 +81,7 @@ def main() -> None:
     _kill_stale_claude_procs()
     reload_env_secrets()
     CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+    (CONTEXT_DIR / "logs").mkdir(parents=True, exist_ok=True)
     WORKSPACES_DIR.mkdir(parents=True, exist_ok=True)
 
     from arbos.goals import load_all_workspaces, goal_manager

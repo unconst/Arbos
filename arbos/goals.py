@@ -12,13 +12,13 @@ import requests
 from arbos.config import (
     WORKSPACES_DIR, PROVIDER, CLAUDE_MODEL, LLM_API_KEY, LLM_BASE_URL,
     CHUTES_BASE_URL, CHUTES_ROUTING_BOT, CHUTES_API_KEY, CLAUDE_TIMEOUT,
-    workspace_dir, goals_json, goal_file, state_file, goal_runs_dir,
+    workspace_dir, goals_dir, goals_json, goal_file, state_file, goal_runs_dir,
 )
 from arbos.log import log
 from arbos.prompt import load_prompt, goal_status_label
 from arbos.runner import run_step
 from arbos.discord_api import send_new
-from arbos.state import GoalState, workspaces, goals_lock, shutdown
+from arbos.state import GoalState, workspaces, goals_lock, shutdown, slugify
 import arbos.state as state
 
 
@@ -27,7 +27,8 @@ def save_goals(workspace: int):
     ws = workspaces.get(workspace, {})
     data = {}
     for tid, gs in ws.items():
-        data[str(tid)] = {
+        entry = {
+            "thread_id": tid,
             "thread_name": gs.thread_name,
             "summary": gs.summary,
             "delay": gs.delay,
@@ -38,38 +39,63 @@ def save_goals(workspace: int):
             "last_run": gs.last_run,
             "last_finished": gs.last_finished,
         }
+        data[gs.thread_slug or str(tid)] = entry
     jf = goals_json(workspace)
     jf.parent.mkdir(parents=True, exist_ok=True)
     jf.write_text(json.dumps(data, indent=2))
 
 
 def load_all_workspaces():
-    """Load goal metadata from all workspace directories."""
+    """Load goal metadata from all workspace directories (slug or legacy numeric)."""
     if not WORKSPACES_DIR.exists():
         return
-    for ws_dir in WORKSPACES_DIR.iterdir():
+    for ws_dir in sorted(WORKSPACES_DIR.iterdir()):
         if not ws_dir.is_dir():
             continue
-        try:
+        workspace = None
+        meta_file = ws_dir / "workspace.json"
+        if meta_file.exists():
+            try:
+                meta = json.loads(meta_file.read_text())
+                workspace = int(meta["discord_channel_id"])
+                state.workspace_id_to_slug[workspace] = ws_dir.name
+                state.channel_names[workspace] = meta.get("name", ws_dir.name)
+            except (json.JSONDecodeError, KeyError, TypeError):
+                continue
+        elif ws_dir.name.isdigit():
             workspace = int(ws_dir.name)
-        except ValueError:
+        else:
             continue
-        jf = goals_json(workspace)
+        jf = ws_dir / "goals.json"
         if not jf.exists():
+            if workspace is not None and meta_file.exists():
+                workspaces[workspace] = {}
             continue
         try:
             data = json.loads(jf.read_text())
         except (json.JSONDecodeError, OSError):
             continue
         ws = {}
-        for tid_str, info in data.items():
-            tid = int(tid_str)
-            if not goal_file(workspace, tid).exists():
+        for key, info in data.items():
+            tid = info.get("thread_id") if isinstance(info, dict) else None
+            if tid is None and key.isdigit():
+                tid = int(key)
+            if tid is None:
                 continue
-            ws[tid] = GoalState(
+            thread_name = info.get("thread_name", "") if isinstance(info, dict) else ""
+            thread_slug = slugify(thread_name) or str(tid)
+            goal_path = ws_dir / "goals" / (key if key.isdigit() else key)
+            if not (goal_path / "GOAL.md").exists():
+                goal_path_legacy = ws_dir / "goals" / str(tid)
+                if (goal_path_legacy / "GOAL.md").exists():
+                    goal_path = goal_path_legacy
+                else:
+                    continue
+            gs = GoalState(
                 thread_id=tid,
                 workspace=workspace,
-                thread_name=info.get("thread_name", ""),
+                thread_name=thread_name,
+                thread_slug=thread_slug,
                 summary=info.get("summary", ""),
                 delay=info.get("delay", 0),
                 started=info.get("started", False),
@@ -79,6 +105,15 @@ def load_all_workspaces():
                 last_run=info.get("last_run", ""),
                 last_finished=info.get("last_finished", ""),
             )
+            ws[tid] = gs
+            old_goal_dir = ws_dir / "goals" / str(tid)
+            new_goal_dir = ws_dir / "goals" / thread_slug
+            if old_goal_dir.exists() and old_goal_dir != new_goal_dir and not new_goal_dir.exists():
+                try:
+                    old_goal_dir.rename(new_goal_dir)
+                    log(f"migrated goal dir {tid} -> {thread_slug}")
+                except OSError:
+                    pass
         if ws:
             workspaces[workspace] = ws
 

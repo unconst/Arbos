@@ -11,7 +11,7 @@ from pathlib import Path
 from arbos.config import (
     WORKING_DIR, PROVIDER, CLAUDE_MODEL, LLM_API_KEY, LLM_BASE_URL,
     PROXY_PORT, IS_ROOT, MAX_RETRIES, CLAUDE_TIMEOUT,
-    workspace_dir, make_run_dir, step_msg_file,
+    workspace_dir, goal_dir, make_run_dir, step_msg_file,
 )
 from arbos.log import log, fmt_duration, fmt_tokens, reset_tokens, get_tokens
 from arbos.redact import redact_secrets
@@ -212,7 +212,10 @@ def run_agent(cmd: list[str], phase: str, output_file: Path,
     claude_semaphore.acquire()
     try:
         env = claude_env(workspace=workspace, thread_id=thread_id)
-        cwd = str(workspace_dir(workspace)) if workspace else None
+        if workspace and thread_id:
+            cwd = str(goal_dir(workspace, thread_id))
+        else:
+            cwd = str(workspace_dir(workspace)) if workspace else None
         flags = " ".join(a for a in cmd if a.startswith("-"))
 
         returncode, result_text, raw_lines, stderr_output = 1, "", [], "no attempts made"
@@ -234,11 +237,18 @@ def run_agent(cmd: list[str], phase: str, output_file: Path,
             if returncode != 0:
                 stderr_snip = (stderr_output or "").strip()[:300]
                 log(f"{phase}: stderr={stderr_snip or '(empty)'}")
+                if returncode == -9:
+                    log(f"{phase}: rc=-9 is SIGKILL — usually our timeout (no output for {CLAUDE_TIMEOUT}s) or OOM/external kill")
                 if attempt < MAX_RETRIES:
                     delay = min(2 ** attempt, 30)
                     log(f"{phase}: retrying in {delay}s (attempt {attempt}/{MAX_RETRIES})")
                     if on_activity:
-                        on_activity(f"⚠ Claude error (rc={returncode}), retrying in {delay}s...")
+                        if returncode == -9 and (stderr_output or "").strip() == "(timed out)":
+                            on_activity(f"⚠ Timed out (no output for {CLAUDE_TIMEOUT}s), retrying in {delay}s...")
+                        elif returncode == -9:
+                            on_activity(f"⚠ Process killed (SIGKILL — timeout or OOM?), retrying in {delay}s...")
+                        else:
+                            on_activity(f"⚠ Claude error (rc={returncode}), retrying in {delay}s...")
                     time.sleep(delay)
                     continue
 
@@ -426,7 +436,7 @@ def run_step(prompt: str, step_number: int, workspace: int = 0, thread_id: int =
             log(f"step message finalize failed: {str(exc)[:120]}")
 
 
-def run_agent_streaming(channel_id: int, msg_id: int, prompt: str, workspace: int = 0, cwd: str | None = None) -> str:
+def run_agent_streaming(channel_id: int, msg_id: int, prompt: str, workspace: int = 0, thread_id: int = 0, cwd: str | None = None) -> str:
     """Run Claude Code CLI and stream output by editing a Discord message.
     Message format matches step logs: Arbos: (41.5s | tokens | $cost)\n{activity}
     """
@@ -436,7 +446,10 @@ def run_agent_streaming(channel_id: int, msg_id: int, prompt: str, workspace: in
         cmd = claude_cmd(prompt, extra_flags=["--model", "bot"])
 
     if cwd is None:
-        cwd = str(workspace_dir(workspace)) if workspace else None
+        if workspace and thread_id:
+            cwd = str(goal_dir(workspace, thread_id))
+        else:
+            cwd = str(workspace_dir(workspace)) if workspace else None
     reset_tokens()
     current_text = ""
     activity_status = ""
@@ -501,10 +514,17 @@ def run_agent_streaming(channel_id: int, msg_id: int, prompt: str, workspace: in
 
             if returncode != 0:
                 stderr_snip = redact_secrets((stderr_output or "").strip())[:200]
+                if returncode == -9:
+                    log(f"run_agent_streaming: rc=-9 SIGKILL — usually timeout (no output for {CLAUDE_TIMEOUT}s) or OOM")
                 if attempt < MAX_RETRIES:
                     delay = min(2 ** attempt, 30)
-                    err_detail = f": {stderr_snip}" if stderr_snip else ""
-                    activity_status = f"⚠ Error (rc={returncode}{err_detail}), retrying in {delay}s... (attempt {attempt}/{MAX_RETRIES})"
+                    if returncode == -9 and (stderr_output or "").strip() == "(timed out)":
+                        activity_status = f"⚠ Timed out (no output for {CLAUDE_TIMEOUT}s), retrying in {delay}s... (attempt {attempt}/{MAX_RETRIES})"
+                    elif returncode == -9:
+                        activity_status = f"⚠ Process killed (SIGKILL), retrying in {delay}s... (attempt {attempt}/{MAX_RETRIES})"
+                    else:
+                        err_detail = f": {stderr_snip}" if stderr_snip else ""
+                        activity_status = f"⚠ Error (rc={returncode}{err_detail}), retrying in {delay}s... (attempt {attempt}/{MAX_RETRIES})"
                     _edit(force=True)
                     time.sleep(delay)
                     continue
