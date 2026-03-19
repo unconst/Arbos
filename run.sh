@@ -287,9 +287,16 @@ fi
 
 printf "\n"
 
-ask_key "TAU_BOT_TOKEN" \
-    "Telegram bot token" \
-    "Create a bot via @BotFather on Telegram, then paste the token here" \
+ask_key "DISCORD_BOT_TOKEN" \
+    "Discord bot token" \
+    "Create a bot at https://discord.com/developers/applications, then paste the token here" \
+    "required"
+
+printf "\n"
+
+ask_key "DISCORD_GUILD_ID" \
+    "Discord guild (server) ID" \
+    "Right-click your server in Discord (with Developer Mode on) and Copy Server ID" \
     "required"
 
 printf "\n"
@@ -359,11 +366,10 @@ printf "  ${DIM}logs${NC}     pm2 logs $PM2_NAME\n"
 printf "  ${DIM}status${NC}   pm2 status\n"
 printf "  ${DIM}restart${NC}  pm2 restart $PM2_NAME\n"
 printf "\n"
-printf "  ${BOLD}Next steps — open Telegram and message your bot:${NC}\n"
-printf "    Just tell it what you want in plain language, e.g.:\n"
-printf "    • \"I want you to build a SOTA quant trading system.\"\n"
-printf "    • \"What's the status of my trading system?\"\n"
-printf "    • \"Set the goal to ...\"\n"
-printf "    • \"Send a message to the trading system.\"\n"
-printf "    • \"...\"\n"
+printf "  ${BOLD}Next steps — open Discord and use your bot:${NC}\n"
+printf "    Use slash commands in any text channel:\n"
+printf "    • /thread \"build trading system\" \"I want you to build a SOTA quant trading system.\"\n"
+printf "    • /ls to list goals\n"
+printf "    • /status for details\n"
+printf "    • Send messages in threads to talk to the agent\n"
 printf "\n"

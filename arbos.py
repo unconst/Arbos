@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import os
@@ -29,12 +30,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 WORKING_DIR = Path(__file__).parent
 PROMPT_FILE = WORKING_DIR / "PROMPT.md"
 CONTEXT_DIR = WORKING_DIR / "context"
-GOALS_DIR = CONTEXT_DIR / "goals"
-GOALS_JSON = CONTEXT_DIR / "goals.json"
-CHATLOG_DIR = CONTEXT_DIR / "chat"
-FILES_DIR = CONTEXT_DIR / "files"
+WORKSPACES_DIR = CONTEXT_DIR / "workspaces"
 RESTART_FLAG = WORKING_DIR / ".restart"
-CHAT_ID_FILE = WORKING_DIR / "chat_id.txt"
 ENV_ENC_FILE = WORKING_DIR / ".env.enc"
 
 # ── Encrypted .env ───────────────────────────────────────────────────────────
@@ -46,7 +43,7 @@ def _derive_fernet_key(passphrase: str) -> bytes:
 
 
 def _encrypt_env_file(bot_token: str):
-    """Encrypt .env → .env.enc and delete the plaintext file."""
+    """Encrypt .env -> .env.enc and delete the plaintext file."""
     env_path = WORKING_DIR / ".env"
     plaintext = env_path.read_bytes()
     f = Fernet(_derive_fernet_key(bot_token))
@@ -80,7 +77,7 @@ def _load_encrypted_env(bot_token: str) -> bool:
 
 def _save_to_encrypted_env(key: str, value: str):
     """Add/update a single key in the encrypted env file."""
-    bot_token = os.environ.get("TAU_BOT_TOKEN", "")
+    bot_token = os.environ.get("DISCORD_BOT_TOKEN", "")
     if not bot_token or not ENV_ENC_FILE.exists():
         return
     try:
@@ -113,16 +110,16 @@ def _init_env():
         load_dotenv(env_path)
         return
 
-    bot_token = os.environ.get("TAU_BOT_TOKEN", "")
+    bot_token = os.environ.get("DISCORD_BOT_TOKEN", "")
     if ENV_ENC_FILE.exists() and bot_token:
         if _load_encrypted_env(bot_token):
             return
-        print("ERROR: failed to decrypt .env.enc — wrong TAU_BOT_TOKEN?", file=sys.stderr)
+        print("ERROR: failed to decrypt .env.enc — wrong DISCORD_BOT_TOKEN?", file=sys.stderr)
         sys.exit(1)
 
     if ENV_ENC_FILE.exists() and not bot_token:
-        print("ERROR: .env.enc exists but TAU_BOT_TOKEN not set.", file=sys.stderr)
-        print("Pass it as an env var: TAU_BOT_TOKEN=xxx python arbos.py", file=sys.stderr)
+        print("ERROR: .env.enc exists but DISCORD_BOT_TOKEN not set.", file=sys.stderr)
+        print("Pass it as an env var: DISCORD_BOT_TOKEN=xxx python arbos.py", file=sys.stderr)
         sys.exit(1)
 
 
@@ -149,7 +146,7 @@ def _process_pending_env():
             with open(env_path, "a") as f:
                 f.write("\n" + content + "\n")
         elif ENV_ENC_FILE.exists():
-            bot_token = os.environ.get("TAU_BOT_TOKEN", "")
+            bot_token = os.environ.get("DISCORD_BOT_TOKEN", "")
             if bot_token:
                 try:
                     existing = _decrypt_env_content(bot_token)
@@ -244,6 +241,10 @@ else:
     CHUTES_ROUTING_BOT = os.environ.get("CHUTES_ROUTING_BOT", f"{CHUTES_POOL}:latency")
     COST_PER_M_INPUT = float(os.environ.get("COST_PER_M_INPUT", "0.14"))
     COST_PER_M_OUTPUT = float(os.environ.get("COST_PER_M_OUTPUT", "0.60"))
+
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+DISCORD_GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", "0"))
+
 IS_ROOT = os.getuid() == 0
 MAX_RETRIES = int(os.environ.get("CLAUDE_MAX_RETRIES", "5"))
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))
@@ -259,13 +260,18 @@ _token_lock = threading.Lock()
 _child_procs: set[subprocess.Popen] = set()
 _child_procs_lock = threading.Lock()
 
+_discord_client: Any = None
+_discord_loop: asyncio.AbstractEventLoop | None = None
 
-# ── Multi-goal state ────────────────────────────────────────────────────────
+
+# ── Multi-goal state (workspace-scoped) ──────────────────────────────────────
 
 
 @dataclass
 class GoalState:
-    index: int
+    thread_id: int
+    workspace: int
+    thread_name: str = ""
     summary: str = ""
     delay: int = 0
     started: bool = False
@@ -279,39 +285,67 @@ class GoalState:
     stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
-_goals: dict[int, GoalState] = {}
+_workspaces: dict[int, dict[int, GoalState]] = {}
 _goals_lock = threading.Lock()
 
 
-def _goal_dir(index: int) -> Path:
-    return GOALS_DIR / str(index)
+# ── Workspace-scoped path helpers ────────────────────────────────────────────
 
 
-def _goal_file(index: int) -> Path:
-    return _goal_dir(index) / "GOAL.md"
+def _workspace_dir(workspace: int) -> Path:
+    return WORKSPACES_DIR / str(workspace)
 
 
-def _state_file(index: int) -> Path:
-    return _goal_dir(index) / "STATE.md"
+def _goals_dir(workspace: int) -> Path:
+    return _workspace_dir(workspace) / "goals"
 
 
-def _inbox_file(index: int) -> Path:
-    return _goal_dir(index) / "INBOX.md"
+def _goals_json(workspace: int) -> Path:
+    return _workspace_dir(workspace) / "goals.json"
 
 
-def _goal_runs_dir(index: int) -> Path:
-    return _goal_dir(index) / "runs"
+def _chatlog_dir(workspace: int) -> Path:
+    return _workspace_dir(workspace) / "chat"
 
 
-def _step_msg_file(index: int) -> Path:
-    return _goal_dir(index) / ".step_msg"
+def _files_dir(workspace: int) -> Path:
+    return _workspace_dir(workspace) / "files"
 
 
-def _save_goals():
-    """Persist goal metadata to goals.json. Caller must hold _goals_lock."""
+def _goal_dir(workspace: int, thread_id: int) -> Path:
+    return _goals_dir(workspace) / str(thread_id)
+
+
+def _goal_file(workspace: int, thread_id: int) -> Path:
+    return _goal_dir(workspace, thread_id) / "GOAL.md"
+
+
+def _state_file(workspace: int, thread_id: int) -> Path:
+    return _goal_dir(workspace, thread_id) / "STATE.md"
+
+
+def _inbox_file(workspace: int, thread_id: int) -> Path:
+    return _goal_dir(workspace, thread_id) / "INBOX.md"
+
+
+def _goal_runs_dir(workspace: int, thread_id: int) -> Path:
+    return _goal_dir(workspace, thread_id) / "runs"
+
+
+def _step_msg_file(workspace: int, thread_id: int) -> Path:
+    return _goal_dir(workspace, thread_id) / ".step_msg"
+
+
+# ── Save/load goals (per workspace) ─────────────────────────────────────────
+
+
+def _save_goals(workspace: int):
+    """Persist goal metadata for a workspace. Caller must hold _goals_lock."""
+    ws = _workspaces.get(workspace, {})
     data = {}
-    for idx, gs in _goals.items():
-        data[str(idx)] = {
+    for tid, gs in ws.items():
+        data[str(tid)] = {
+            "thread_name": gs.thread_name,
             "summary": gs.summary,
             "delay": gs.delay,
             "started": gs.started,
@@ -321,34 +355,50 @@ def _save_goals():
             "last_run": gs.last_run,
             "last_finished": gs.last_finished,
         }
-    GOALS_JSON.parent.mkdir(parents=True, exist_ok=True)
-    GOALS_JSON.write_text(json.dumps(data, indent=2))
+    jf = _goals_json(workspace)
+    jf.parent.mkdir(parents=True, exist_ok=True)
+    jf.write_text(json.dumps(data, indent=2))
 
 
-def _load_goals():
-    """Load goal metadata from goals.json into _goals dict."""
-    global _goals
-    if not GOALS_JSON.exists():
+def _load_all_workspaces():
+    """Load goal metadata from all workspace directories."""
+    global _workspaces
+    if not WORKSPACES_DIR.exists():
         return
-    try:
-        data = json.loads(GOALS_JSON.read_text())
-    except (json.JSONDecodeError, OSError):
-        return
-    for idx_str, info in data.items():
-        idx = int(idx_str)
-        if not _goal_file(idx).exists():
+    for ws_dir in WORKSPACES_DIR.iterdir():
+        if not ws_dir.is_dir():
             continue
-        _goals[idx] = GoalState(
-            index=idx,
-            summary=info.get("summary", ""),
-            delay=info.get("delay", 0),
-            started=info.get("started", False),
-            paused=info.get("paused", False),
-            step_count=info.get("step_count", 0),
-            goal_hash=info.get("goal_hash", ""),
-            last_run=info.get("last_run", ""),
-            last_finished=info.get("last_finished", ""),
-        )
+        try:
+            workspace = int(ws_dir.name)
+        except ValueError:
+            continue
+        jf = _goals_json(workspace)
+        if not jf.exists():
+            continue
+        try:
+            data = json.loads(jf.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        ws = {}
+        for tid_str, info in data.items():
+            tid = int(tid_str)
+            if not _goal_file(workspace, tid).exists():
+                continue
+            ws[tid] = GoalState(
+                thread_id=tid,
+                workspace=workspace,
+                thread_name=info.get("thread_name", ""),
+                summary=info.get("summary", ""),
+                delay=info.get("delay", 0),
+                started=info.get("started", False),
+                paused=info.get("paused", False),
+                step_count=info.get("step_count", 0),
+                goal_hash=info.get("goal_hash", ""),
+                last_run=info.get("last_run", ""),
+                last_finished=info.get("last_finished", ""),
+            )
+        if ws:
+            _workspaces[workspace] = ws
 
 
 def _format_last_time(iso_ts: str) -> str:
@@ -422,41 +472,42 @@ def fmt_tokens(inp: int, out: int, elapsed: float = 0) -> str:
     return f"{_k(inp)} in / {_k(out)} out{tps}{cost_str}"
 
 
-# ── Prompt helpers ───────────────────────────────────────────────────────────
+# ── Prompt helpers (workspace-scoped) ────────────────────────────────────────
 
-def load_prompt(goal_index: int, consume_inbox: bool = False, goal_step: int = 0) -> str:
+def load_prompt(workspace: int, thread_id: int, consume_inbox: bool = False, goal_step: int = 0) -> str:
     """Build full prompt: PROMPT.md + goal's GOAL/STATE/INBOX + chatlog."""
     parts = []
     if PROMPT_FILE.exists():
         text = PROMPT_FILE.read_text().strip()
         if text:
             parts.append(text)
-    gf = _goal_file(goal_index)
+    gf = _goal_file(workspace, thread_id)
     if gf.exists():
         goal_text = gf.read_text().strip()
         if goal_text:
-            header = f"## Goal #{goal_index} (step {goal_step})" if goal_step else f"## Goal #{goal_index}"
-            parts.append(f"{header}\n\n{goal_text}\n\nYour context files are in context/goals/{goal_index}/ (STATE.md, INBOX.md, runs/).")
-    sf = _state_file(goal_index)
+            header = f"## Goal (step {goal_step})" if goal_step else "## Goal"
+            ctx_path = f"context/workspaces/{workspace}/goals/{thread_id}/"
+            parts.append(f"{header}\n\n{goal_text}\n\nYour context files are in {ctx_path} (STATE.md, INBOX.md, runs/).")
+    sf = _state_file(workspace, thread_id)
     if sf.exists():
         state_text = sf.read_text().strip()
         if state_text:
             parts.append(f"## State\n\n{state_text}")
-    inf = _inbox_file(goal_index)
+    inf = _inbox_file(workspace, thread_id)
     if inf.exists():
         inbox_text = inf.read_text().strip()
         if inbox_text:
             parts.append(f"## Inbox\n\n{inbox_text}")
         if consume_inbox:
             inf.write_text("")
-    chatlog = load_chatlog()
+    chatlog = load_chatlog(workspace)
     if chatlog:
         parts.append(chatlog)
     return "\n\n".join(parts)
 
 
-def make_run_dir(goal_index: int = 0) -> Path:
-    runs_dir = _goal_runs_dir(goal_index) if goal_index else GOALS_DIR / "_runs"
+def make_run_dir(workspace: int, thread_id: int) -> Path:
+    runs_dir = _goal_runs_dir(workspace, thread_id)
     runs_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = runs_dir / ts
@@ -464,14 +515,15 @@ def make_run_dir(goal_index: int = 0) -> Path:
     return run_dir
 
 
-def log_chat(role: str, text: str):
-    """Append to chatlog, rolling to a new file when size exceeds limit."""
+def log_chat(workspace: int, role: str, text: str):
+    """Append to workspace chatlog, rolling to a new file when size exceeds limit."""
     with _chatlog_lock:
-        CHATLOG_DIR.mkdir(parents=True, exist_ok=True)
+        chat_dir = _chatlog_dir(workspace)
+        chat_dir.mkdir(parents=True, exist_ok=True)
         max_file_size = 4000
         max_files = 50
 
-        existing = sorted(CHATLOG_DIR.glob("*.jsonl"))
+        existing = sorted(chat_dir.glob("*.jsonl"))
 
         current: Path | None = None
         if existing and existing[-1].stat().st_size < max_file_size:
@@ -479,22 +531,23 @@ def log_chat(role: str, text: str):
 
         if current is None:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            current = CHATLOG_DIR / f"{ts}.jsonl"
+            current = chat_dir / f"{ts}.jsonl"
 
         entry = json.dumps({"role": role, "text": _redact_secrets(text[:1000]), "ts": datetime.now().isoformat()})
         with open(current, "a", encoding="utf-8") as f:
             f.write(entry + "\n")
 
-        all_files = sorted(CHATLOG_DIR.glob("*.jsonl"))
+        all_files = sorted(chat_dir.glob("*.jsonl"))
         for old in all_files[:-max_files]:
             old.unlink(missing_ok=True)
 
 
-def load_chatlog(max_chars: int = 8000) -> str:
-    """Load recent Telegram chat history."""
-    if not CHATLOG_DIR.exists():
+def load_chatlog(workspace: int, max_chars: int = 8000) -> str:
+    """Load recent Discord chat history for a workspace."""
+    chat_dir = _chatlog_dir(workspace)
+    if not chat_dir.exists():
         return ""
-    files = sorted(CHATLOG_DIR.glob("*.jsonl"))
+    files = sorted(chat_dir.glob("*.jsonl"))
     if not files:
         return ""
 
@@ -509,158 +562,155 @@ def load_chatlog(max_chars: int = 8000) -> str:
             entry = f"[{msg.get('ts', '?')[:16]}] {msg['role']}: {msg['text']}"
             if total + len(entry) > max_chars:
                 lines.reverse()
-                return "## Recent Telegram chat\n\n" + "\n".join(lines)
+                return "## Recent Discord chat\n\n" + "\n".join(lines)
             lines.append(entry)
             total += len(entry) + 1
 
     lines.reverse()
     if not lines:
         return ""
-    return "## Recent Telegram chat\n\n" + "\n".join(lines)
+    return "## Recent Discord chat\n\n" + "\n".join(lines)
 
 
-# ── Step update helpers ──────────────────────────────────────────────────────
+# ── Discord messaging ────────────────────────────────────────────────────────
+
+DISCORD_API = "https://discord.com/api/v10"
 
 
-def _step_update_target() -> tuple[str, str] | None:
-    token = os.getenv("TAU_BOT_TOKEN")
+def _discord_rest_send(channel_id: int, text: str) -> int | None:
+    """Send a message via Discord REST API. Returns message ID or None."""
+    token = os.getenv("DISCORD_BOT_TOKEN")
     if not token:
-        _log("step update skipped: TAU_BOT_TOKEN not set")
         return None
-    if not CHAT_ID_FILE.exists():
-        _log("step update skipped: chat_id.txt not found")
-        return None
-    chat_id = CHAT_ID_FILE.read_text().strip()
-    if not chat_id:
-        _log("step update skipped: empty chat_id.txt")
-        return None
-    return token, chat_id
-
-
-def _send_telegram_text(text: str, *, target: tuple[str, str] | None = None) -> bool:
-    target = target or _step_update_target()
-    if not target:
-        return False
-    token, chat_id = target
-    text = _redact_secrets(text)
+    text = _redact_secrets(text)[:2000]
     try:
-        response = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text[:4000]},
+        resp = requests.post(
+            f"{DISCORD_API}/channels/{channel_id}/messages",
+            json={"content": text},
+            headers={"Authorization": f"Bot {token}", "Content-Type": "application/json"},
             timeout=15,
         )
-        response.raise_for_status()
+        if resp.status_code in (200, 201):
+            return int(resp.json()["id"])
     except Exception as exc:
-        _log(f"telegram send failed: {str(exc)[:120]}")
+        _log(f"discord REST send failed: {str(exc)[:120]}")
+    return None
+
+
+def _discord_rest_edit(channel_id: int, message_id: int, text: str) -> bool:
+    """Edit a message via Discord REST API."""
+    token = os.getenv("DISCORD_BOT_TOKEN")
+    if not token:
         return False
-    log_chat("bot", text[:1000])
-    _log("telegram message sent")
-    return True
-
-
-def _send_telegram_new(text: str, *, target: tuple[str, str] | None = None) -> int | None:
-    """Send a new Telegram message and return its message_id."""
-    target = target or _step_update_target()
-    if not target:
-        return None
-    token, chat_id = target
-    text = _redact_secrets(text)
+    text = _redact_secrets(text)[:2000]
     try:
-        response = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text[:4000]},
+        resp = requests.patch(
+            f"{DISCORD_API}/channels/{channel_id}/messages/{message_id}",
+            json={"content": text},
+            headers={"Authorization": f"Bot {token}", "Content-Type": "application/json"},
             timeout=15,
         )
-        response.raise_for_status()
-        return response.json().get("result", {}).get("message_id")
-    except Exception as exc:
-        _log(f"telegram send failed: {str(exc)[:120]}")
-        return None
-
-
-def _edit_telegram_text(message_id: int, text: str, *, target: tuple[str, str] | None = None) -> bool:
-    """Edit an existing Telegram message."""
-    target = target or _step_update_target()
-    if not target:
-        return False
-    token, chat_id = target
-    text = _redact_secrets(text)
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{token}/editMessageText",
-            json={"chat_id": chat_id, "message_id": message_id, "text": text[:4000]},
-            timeout=15,
-        )
-        return True
+        return resp.status_code == 200
     except Exception:
         return False
 
 
-def _send_telegram_document(file_path: str, caption: str = "", *, target: tuple[str, str] | None = None) -> bool:
-    """Send a file as a Telegram document."""
-    target = target or _step_update_target()
-    if not target:
+def _discord_rest_send_file(channel_id: int, file_path: str, caption: str = "") -> bool:
+    """Send a file via Discord REST API."""
+    token = os.getenv("DISCORD_BOT_TOKEN")
+    if not token:
         return False
-    token, chat_id = target
-    caption = _redact_secrets(caption)[:1024]
+    caption = _redact_secrets(caption)[:2000]
     try:
+        data = {}
+        if caption:
+            data["content"] = caption
         with open(file_path, "rb") as f:
-            response = requests.post(
-                f"https://api.telegram.org/bot{token}/sendDocument",
-                data={"chat_id": chat_id, "caption": caption},
-                files={"document": (Path(file_path).name, f)},
+            resp = requests.post(
+                f"{DISCORD_API}/channels/{channel_id}/messages",
+                data=data,
+                files={"file": (Path(file_path).name, f)},
+                headers={"Authorization": f"Bot {token}"},
                 timeout=60,
             )
-        response.raise_for_status()
-        _log(f"telegram document sent: {Path(file_path).name}")
-        log_chat("bot", f"[sent file: {Path(file_path).name}] {caption}")
-        return True
+        return resp.status_code in (200, 201)
     except Exception as exc:
-        _log(f"telegram document send failed: {str(exc)[:120]}")
+        _log(f"discord REST file send failed: {str(exc)[:120]}")
         return False
 
 
-def _send_telegram_photo(file_path: str, caption: str = "", *, target: tuple[str, str] | None = None) -> bool:
-    """Send an image as a Telegram photo (compressed)."""
-    target = target or _step_update_target()
-    if not target:
-        return False
-    token, chat_id = target
-    caption = _redact_secrets(caption)[:1024]
-    try:
-        with open(file_path, "rb") as f:
-            response = requests.post(
-                f"https://api.telegram.org/bot{token}/sendPhoto",
-                data={"chat_id": chat_id, "caption": caption},
-                files={"photo": (Path(file_path).name, f)},
-                timeout=60,
-            )
-        response.raise_for_status()
-        _log(f"telegram photo sent: {Path(file_path).name}")
-        log_chat("bot", f"[sent photo: {Path(file_path).name}] {caption}")
-        return True
-    except Exception as exc:
-        _log(f"telegram photo send failed: {str(exc)[:120]}")
-        return False
+def _send_discord_new(channel_id: int, text: str) -> int | None:
+    """Send a new Discord message. Works from any thread via async bridge or REST fallback."""
+    text = _redact_secrets(text)[:2000]
+    if _discord_client and _discord_loop and _discord_loop.is_running():
+        try:
+            async def _do():
+                ch = _discord_client.get_channel(channel_id)
+                if not ch:
+                    ch = await _discord_client.fetch_channel(channel_id)
+                msg = await ch.send(text)
+                return msg.id
+            future = asyncio.run_coroutine_threadsafe(_do(), _discord_loop)
+            return future.result(timeout=15)
+        except Exception as exc:
+            _log(f"discord send failed (async): {str(exc)[:120]}")
+    return _discord_rest_send(channel_id, text)
 
 
-def _download_telegram_file(bot, file_id: str, filename: str) -> Path:
-    """Download a file from Telegram and save it to FILES_DIR."""
-    FILES_DIR.mkdir(parents=True, exist_ok=True)
-    file_info = bot.get_file(file_id)
-    downloaded = bot.download_file(file_info.file_path)
-    save_path = FILES_DIR / filename
-    # avoid overwriting: append a suffix if the file already exists
+def _edit_discord_text(channel_id: int, message_id: int, text: str) -> bool:
+    """Edit a Discord message. Works from any thread via async bridge or REST fallback."""
+    text = _redact_secrets(text)[:2000]
+    if _discord_client and _discord_loop and _discord_loop.is_running():
+        try:
+            async def _do():
+                ch = _discord_client.get_channel(channel_id)
+                if not ch:
+                    ch = await _discord_client.fetch_channel(channel_id)
+                msg = await ch.fetch_message(message_id)
+                await msg.edit(content=text)
+            future = asyncio.run_coroutine_threadsafe(_do(), _discord_loop)
+            future.result(timeout=15)
+            return True
+        except Exception as exc:
+            _log(f"discord edit failed (async): {str(exc)[:120]}")
+    return _discord_rest_edit(channel_id, message_id, text)
+
+
+def _send_discord_file(channel_id: int, file_path: str, caption: str = "") -> bool:
+    """Send a file to a Discord channel."""
+    caption = _redact_secrets(caption)[:2000]
+    if _discord_client and _discord_loop and _discord_loop.is_running():
+        try:
+            import discord as _dc
+            async def _do():
+                ch = _discord_client.get_channel(channel_id)
+                if not ch:
+                    ch = await _discord_client.fetch_channel(channel_id)
+                await ch.send(content=caption or None, file=_dc.File(file_path))
+            future = asyncio.run_coroutine_threadsafe(_do(), _discord_loop)
+            future.result(timeout=60)
+            return True
+        except Exception as exc:
+            _log(f"discord file send failed (async): {str(exc)[:120]}")
+    return _discord_rest_send_file(channel_id, file_path, caption)
+
+
+def _download_discord_attachment(url: str, filename: str, workspace: int) -> Path:
+    """Download a Discord attachment and save it to the workspace files directory."""
+    fdir = _files_dir(workspace)
+    fdir.mkdir(parents=True, exist_ok=True)
+    save_path = fdir / filename
     if save_path.exists():
         stem, suffix = save_path.stem, save_path.suffix
         ts = datetime.now().strftime("%H%M%S")
-        save_path = FILES_DIR / f"{stem}_{ts}{suffix}"
-    save_path.write_bytes(downloaded)
-    _log(f"saved telegram file: {save_path.name} ({len(downloaded)} bytes)")
+        save_path = fdir / f"{stem}_{ts}{suffix}"
+    resp = requests.get(url, timeout=60)
+    save_path.write_bytes(resp.content)
+    _log(f"saved discord file: {save_path.name} ({len(resp.content)} bytes)")
     return save_path
 
 
-# ── Chutes proxy (Anthropic Messages API → OpenAI Chat Completions) ──────────
+# ── Chutes proxy (Anthropic Messages API -> OpenAI Chat Completions) ──────────
 
 _proxy_app = FastAPI(title="Chutes Proxy")
 
@@ -1226,11 +1276,13 @@ def _write_claude_settings():
     _log(f"wrote .claude/settings.local.json (provider={PROVIDER}, model={CLAUDE_MODEL}, target={target_label})")
 
 
-def _claude_env(goal_index: int = 0) -> dict[str, str]:
+def _claude_env(workspace: int = 0, thread_id: int = 0) -> dict[str, str]:
     env = os.environ.copy()
-    env.pop("TAU_BOT_TOKEN", None)
-    if goal_index:
-        env["ARBOS_GOAL_INDEX"] = str(goal_index)
+    env.pop("DISCORD_BOT_TOKEN", None)
+    if workspace:
+        env["ARBOS_WORKSPACE"] = str(workspace)
+    if thread_id:
+        env["ARBOS_THREAD_ID"] = str(thread_id)
     if PROVIDER == "openrouter":
         env["ANTHROPIC_API_KEY"] = LLM_API_KEY
         env["ANTHROPIC_BASE_URL"] = LLM_BASE_URL
@@ -1349,10 +1401,10 @@ def _run_claude_once(cmd, env, on_text=None, on_activity=None):
 
 
 def run_agent(cmd: list[str], phase: str, output_file: Path,
-              on_text=None, on_activity=None, goal_index: int = 0) -> subprocess.CompletedProcess:
+              on_text=None, on_activity=None, workspace: int = 0, thread_id: int = 0) -> subprocess.CompletedProcess:
     _claude_semaphore.acquire()
     try:
-        env = _claude_env(goal_index=goal_index)
+        env = _claude_env(workspace=workspace, thread_id=thread_id)
         flags = " ".join(a for a in cmd if a.startswith("-"))
 
         returncode, result_text, raw_lines, stderr_output = 1, "", [], "no attempts made"
@@ -1399,41 +1451,39 @@ def extract_text(result: subprocess.CompletedProcess) -> str:
     return output
 
 
-def run_step(prompt: str, step_number: int, goal_index: int = 0, goal_step: int = 0) -> bool:
-    run_dir = make_run_dir(goal_index=goal_index)
+def run_step(prompt: str, step_number: int, workspace: int = 0, thread_id: int = 0, goal_step: int = 0) -> bool:
+    run_dir = make_run_dir(workspace=workspace, thread_id=thread_id)
     t0 = time.monotonic()
 
     log_file = run_dir / "logs.txt"
     _tls.log_fh = open(log_file, "a", encoding="utf-8")
 
-    smf = _step_msg_file(goal_index) if goal_index else CONTEXT_DIR / ".step_msg"
+    smf = _step_msg_file(workspace, thread_id)
+    smf.parent.mkdir(parents=True, exist_ok=True)
 
-    target = _step_update_target()
-    step_label = f"Goal #{goal_index} Step {goal_step}" if goal_index else f"Step {step_number}"
+    step_label = f"Goal Step {goal_step}" if goal_step else f"Step {step_number}"
     step_msg_id: int | None = None
     step_msg_text = ""
     last_edit = 0.0
 
-    if target:
-        step_msg_id = _send_telegram_new(f"{step_label}: starting...", target=target)
-        if step_msg_id:
-            smf.parent.mkdir(parents=True, exist_ok=True)
-            smf.write_text(json.dumps({
-                "msg_id": step_msg_id, "text": f"{step_label}: starting...",
-            }))
+    step_msg_id = _send_discord_new(thread_id, f"{step_label}: starting...")
+    if step_msg_id:
+        smf.write_text(json.dumps({
+            "msg_id": step_msg_id, "channel_id": thread_id, "text": f"{step_label}: starting...",
+        }))
     else:
         smf.unlink(missing_ok=True)
 
     def _edit_step_msg(text: str, *, force: bool = False):
         nonlocal last_edit, step_msg_text
-        if not step_msg_id or not target:
+        if not step_msg_id:
             return
         now = time.time()
         if not force and now - last_edit < 3.0:
             return
         step_msg_text = text
-        _edit_telegram_text(step_msg_id, text, target=target)
-        smf.write_text(json.dumps({"msg_id": step_msg_id, "text": text}))
+        _edit_discord_text(thread_id, step_msg_id, text)
+        smf.write_text(json.dumps({"msg_id": step_msg_id, "channel_id": thread_id, "text": text}))
         last_edit = now
 
     _reset_tokens()
@@ -1460,19 +1510,20 @@ def run_step(prompt: str, step_number: int, goal_index: int = 0, goal_step: int 
     try:
         _log(f"run dir {run_dir}")
 
-        preview = prompt[:200] + ("…" if len(prompt) > 200 else "")
+        preview = prompt[:200] + ("..." if len(prompt) > 200 else "")
         _log(f"prompt preview: {preview}")
 
-        _log(f"goal #{goal_index} step {goal_step}: executing")
+        _log(f"workspace={workspace} thread={thread_id} step {goal_step}: executing")
 
         threading.Thread(target=_heartbeat, daemon=True).start()
 
         result = run_agent(
             _claude_cmd(prompt),
-            phase=f"goal#{goal_index}",
+            phase=f"ws{workspace}/t{thread_id}",
             output_file=run_dir / "output.txt",
             on_activity=_on_activity,
-            goal_index=goal_index,
+            workspace=workspace,
+            thread_id=thread_id,
         )
 
         rollout_text = _redact_secrets(extract_text(result))
@@ -1512,35 +1563,36 @@ def run_step(prompt: str, step_number: int, goal_index: int = 0, goal_step: int 
             if agent_text:
                 parts.append(agent_text)
             if rollout.strip():
-                parts.append(rollout.strip()[:3500])
+                parts.append(rollout.strip()[:1800])
             final = "\n\n".join(parts)
 
             _edit_step_msg(final, force=True)
-            log_chat("bot", final[:1000])
+            log_chat(workspace, "bot", final[:1000])
             smf.unlink(missing_ok=True)
         except Exception as exc:
             _log(f"step message finalize failed: {str(exc)[:120]}")
 
 
-# ── Agent loop ───────────────────────────────────────────────────────────────
+# ── Agent loop (workspace-scoped) ────────────────────────────────────────────
 
 
-def _goal_loop(index: int):
+def _goal_loop(workspace: int, thread_id: int):
     """Run the agent loop for a single goal. Exits when stop_event is set."""
     global _step_count
 
     with _goals_lock:
-        gs = _goals.get(index)
+        ws = _workspaces.get(workspace, {})
+        gs = ws.get(thread_id)
     if not gs:
         return
 
     failures = 0
-    gf = _goal_file(index)
+    gf = _goal_file(workspace, thread_id)
 
     while not gs.stop_event.is_set():
         if not gf.exists() or not gf.read_text().strip():
             if gs.goal_hash:
-                _log(f"goal #{index} cleared after {gs.step_count} steps")
+                _log(f"goal ws={workspace} t={thread_id} cleared after {gs.step_count} steps")
                 gs.goal_hash = ""
                 gs.step_count = 0
             gs.wake.wait(timeout=5)
@@ -1556,38 +1608,38 @@ def _goal_loop(index: int):
         current_hash = hashlib.sha256(current_goal.encode()).hexdigest()[:16]
         if current_hash != gs.goal_hash:
             if gs.goal_hash:
-                _log(f"goal #{index} changed after {gs.step_count} steps on previous goal")
+                _log(f"goal ws={workspace} t={thread_id} changed after {gs.step_count} steps on previous goal")
             gs.goal_hash = current_hash
             gs.step_count = 0
-            _log(f"goal #{index} new [{current_hash}]: {current_goal[:100]}")
+            _log(f"goal ws={workspace} t={thread_id} new [{current_hash}]: {current_goal[:100]}")
 
         _step_count += 1
         gs.step_count += 1
         gs.last_run = datetime.now().isoformat()
         with _goals_lock:
-            _save_goals()
+            _save_goals(workspace)
 
-        _log(f"Goal #{index} Step {gs.step_count} (global step {_step_count})", blank=True)
+        _log(f"Goal ws={workspace} t={thread_id} Step {gs.step_count} (global step {_step_count})", blank=True)
 
-        prompt = load_prompt(goal_index=index, consume_inbox=True, goal_step=gs.step_count)
+        prompt = load_prompt(workspace=workspace, thread_id=thread_id, consume_inbox=True, goal_step=gs.step_count)
         if not prompt:
             gs.wake.wait(timeout=5)
             gs.wake.clear()
             continue
 
-        _log(f"goal #{index}: prompt={len(prompt)} chars")
+        _log(f"goal ws={workspace} t={thread_id}: prompt={len(prompt)} chars")
 
-        success = run_step(prompt, _step_count, goal_index=index, goal_step=gs.step_count)
+        success = run_step(prompt, _step_count, workspace=workspace, thread_id=thread_id, goal_step=gs.step_count)
 
         gs.last_finished = datetime.now().isoformat()
         with _goals_lock:
-            _save_goals()
+            _save_goals(workspace)
 
         if success:
             failures = 0
         else:
             failures += 1
-            _log(f"goal #{index}: failure #{failures}")
+            _log(f"goal ws={workspace} t={thread_id}: failure #{failures}")
 
         gs.wake.clear()
 
@@ -1595,33 +1647,37 @@ def _goal_loop(index: int):
         if failures:
             backoff = min(2 ** failures, 120)
             step_delay += backoff
-            _log(f"goal #{index}: waiting {step_delay}s (failure backoff + delay)")
+            _log(f"goal ws={workspace} t={thread_id}: waiting {step_delay}s (failure backoff + delay)")
             gs.wake.wait(timeout=step_delay)
         elif step_delay > 0:
-            _log(f"goal #{index}: waiting {step_delay}s (delay)")
+            _log(f"goal ws={workspace} t={thread_id}: waiting {step_delay}s (delay)")
             gs.wake.wait(timeout=step_delay)
 
-    _log(f"goal #{index} loop exited")
+    _log(f"goal ws={workspace} t={thread_id} loop exited")
 
 
 def _goal_manager():
-    """Monitor _goals and spawn/stop goal threads as needed."""
+    """Monitor all workspaces and spawn/stop goal threads as needed."""
     while not _shutdown.is_set():
         with _goals_lock:
-            for idx, gs in list(_goals.items()):
-                if gs.started and not gs.paused and gs.thread is None:
-                    gs.stop_event.clear()
-                    t = threading.Thread(target=_goal_loop, args=(idx,), daemon=True, name=f"goal-{idx}")
-                    gs.thread = t
-                    t.start()
-                    _log(f"goal #{idx} thread spawned")
-                elif gs.started and gs.paused and gs.thread is not None:
-                    pass  # thread idles on its own
-                elif not gs.started and gs.thread is not None:
-                    gs.stop_event.set()
-                    gs.wake.set()
-                if gs.thread is not None and not gs.thread.is_alive():
-                    gs.thread = None
+            for ws_id, ws in list(_workspaces.items()):
+                for tid, gs in list(ws.items()):
+                    if gs.started and not gs.paused and gs.thread is None:
+                        gs.stop_event.clear()
+                        t = threading.Thread(
+                            target=_goal_loop, args=(ws_id, tid),
+                            daemon=True, name=f"goal-{ws_id}-{tid}",
+                        )
+                        gs.thread = t
+                        t.start()
+                        _log(f"goal ws={ws_id} t={tid} thread spawned")
+                    elif gs.started and gs.paused and gs.thread is not None:
+                        pass
+                    elif not gs.started and gs.thread is not None:
+                        gs.stop_event.set()
+                        gs.wake.set()
+                    if gs.thread is not None and not gs.thread.is_alive():
+                        gs.thread = None
         _shutdown.wait(timeout=2)
 
 
@@ -1681,28 +1737,29 @@ def transcribe_voice(file_path: str, fmt: str = "ogg") -> str:
             if text.strip():
                 _log(f"whisper transcription ok ({len(text)} chars)")
                 return text.strip()
-            return "(voice transcription returned empty — send text instead)"
+            return "(voice transcription returned empty -- send text instead)"
         _log(f"whisper STT failed: status={resp.status_code} body={resp.text[:200]}")
-        return "(voice transcription unavailable — send text instead)"
+        return "(voice transcription unavailable -- send text instead)"
     except Exception as exc:
         _log(f"transcription failed: {str(exc)[:200]}")
-        return "(voice transcription unavailable — send text instead)"
+        return "(voice transcription unavailable -- send text instead)"
 
 
-# ── Telegram bot ─────────────────────────────────────────────────────────────
+# ── Operator prompt (workspace-aware) ────────────────────────────────────────
 
-def _recent_context(max_chars: int = 6000) -> str:
-    """Collect recent rollouts across all goals."""
+def _recent_context(workspace: int, max_chars: int = 6000) -> str:
+    """Collect recent rollouts across goals in a workspace."""
+    ws = _workspaces.get(workspace, {})
     parts: list[str] = []
     total = 0
     all_runs: list[tuple[str, Path]] = []
-    for idx, gs in sorted(_goals.items()):
-        runs_dir = _goal_runs_dir(idx)
+    for tid, gs in sorted(ws.items()):
+        runs_dir = _goal_runs_dir(workspace, tid)
         if not runs_dir.exists():
             continue
         for d in runs_dir.iterdir():
             if d.is_dir():
-                all_runs.append((f"goal#{idx}/{d.name}", d))
+                all_runs.append((f"{gs.thread_name or tid}/{d.name}", d))
     all_runs.sort(key=lambda x: x[1].name, reverse=True)
     for label, run_dir in all_runs:
         f = run_dir / "rollout.md"
@@ -1718,13 +1775,19 @@ def _recent_context(max_chars: int = 6000) -> str:
     return "".join(parts)
 
 
-def _build_operator_prompt(user_text: str) -> str:
-    """Build prompt for the CLI agent to handle any operator request."""
-    chatlog = load_chatlog(max_chars=4000)
+def _build_operator_prompt(workspace: int, user_text: str, thread_id: int = 0) -> str:
+    """Build prompt for the CLI agent to handle an operator request.
+
+    If thread_id is set, focuses on that specific goal's context.
+    Otherwise includes all goals in the workspace.
+    """
+    chatlog = load_chatlog(workspace, max_chars=4000)
+    ws = _workspaces.get(workspace, {})
+    ctx_base = f"context/workspaces/{workspace}/"
 
     parts = [
         "You are the operator interface for Arbos, a coding agent running in a loop via pm2.\n"
-        "The operator communicates with you through Telegram. Be concise and direct.\n"
+        "The operator communicates with you through Discord. Be concise and direct.\n"
         "When the operator asks you to do something, do it by modifying the relevant files.\n"
         "When the operator asks a question, answer from the available context.\n\n"
         "## Security\n\n"
@@ -1732,32 +1795,45 @@ def _build_operator_prompt(user_text: str) -> str:
         "Do not include API keys, passwords, seed phrases, or credentials in any response.\n"
         "If asked to show secrets, refuse. The .env file is encrypted; do not attempt to decrypt it.\n\n"
         "## Multi-goal system\n\n"
-        "Goals are indexed and stored in `context/goals/<index>/`. Each goal has its own GOAL.md, STATE.md, INBOX.md, and runs/.\n"
-        "Goal management is handled via Telegram commands (/goal, /start, /stop, /pause, /delete, /delay, /ls, /status).\n"
-        "To modify a specific goal's context, write to `context/goals/<index>/STATE.md` or `context/goals/<index>/INBOX.md`.\n\n"
+        f"Goals are stored in `{ctx_base}goals/<thread_id>/`. Each goal has its own GOAL.md, STATE.md, INBOX.md, and runs/.\n"
+        "Goal management is handled via Discord slash commands (/thread, /start, /stop, /pause, /delete, /delay, /ls, /status).\n"
+        f"To modify a specific goal's context, write to `{ctx_base}goals/<thread_id>/STATE.md` or `{ctx_base}goals/<thread_id>/INBOX.md`.\n\n"
         "## Available operations\n\n"
-        "- **Message a goal's agent**: append a timestamped line to `context/goals/<index>/INBOX.md`.\n"
-        "- **Update a goal's state**: write to `context/goals/<index>/STATE.md`.\n"
+        f"- **Message a goal's agent**: append a timestamped line to `{ctx_base}goals/<thread_id>/INBOX.md`.\n"
+        f"- **Update a goal's state**: write to `{ctx_base}goals/<thread_id>/STATE.md`.\n"
         "- **Set system prompt**: write to `PROMPT.md`.\n"
         "- **Set env variable**: write `KEY='VALUE'` lines (one per line) to `context/.env.pending`. They are picked up automatically and persisted.\n"
-        "- **View logs**: read files in `context/goals/<index>/runs/<timestamp>/` (rollout.md, logs.txt).\n"
+        f"- **View logs**: read files in `{ctx_base}goals/<thread_id>/runs/<timestamp>/` (rollout.md, logs.txt).\n"
         "- **Modify code & restart**: edit code files, then run `touch .restart`.\n"
         "- **Send follow-up**: run `python arbos.py send \"your text here\"`.\n"
-        "- **Send file to operator**: run `python arbos.py sendfile path/to/file [--caption 'text'] [--photo]`.\n"
-        "- **Received files**: operator-sent files are saved in `context/files/` and their path is shown in the message.",
+        "- **Send file to operator**: run `python arbos.py sendfile path/to/file [--caption 'text']`.\n"
+        f"- **Received files**: operator-sent files are saved in `{ctx_base}files/` and their path is shown in the message.",
     ]
 
-    if _goals:
+    if thread_id and thread_id in ws:
+        gs = ws[thread_id]
+        status = _goal_status_label(gs)
+        gf = _goal_file(workspace, thread_id)
+        goal_text = gf.read_text().strip()[:500] if gf.exists() else "(empty)"
+        sf = _state_file(workspace, thread_id)
+        state_text = sf.read_text().strip()[:500] if sf.exists() else "(empty)"
+        parts.append(
+            f"## Current Goal: {gs.thread_name} [{status}] (delay: {gs.delay}s, step {gs.step_count})\n"
+            f"Thread ID: {thread_id}\n\n"
+            f"{goal_text}\n\nState: {state_text}"
+        )
+    elif ws:
         goals_section = []
-        for idx in sorted(_goals.keys()):
-            gs = _goals[idx]
+        for tid in sorted(ws.keys()):
+            gs = ws[tid]
             status = _goal_status_label(gs)
-            gf = _goal_file(idx)
+            gf = _goal_file(workspace, tid)
             goal_text = gf.read_text().strip()[:200] if gf.exists() else "(empty)"
-            sf = _state_file(idx)
+            sf = _state_file(workspace, tid)
             state_text = sf.read_text().strip()[:200] if sf.exists() else "(empty)"
             goals_section.append(
-                f"### Goal #{idx} [{status}] (delay: {gs.delay}s, step {gs.step_count})\n"
+                f"### {gs.thread_name} [{status}] (delay: {gs.delay}s, step {gs.step_count})\n"
+                f"Thread ID: {tid}\n"
                 f"{goal_text}\nState: {state_text}"
             )
         parts.append("## Goals\n" + "\n\n".join(goals_section))
@@ -1767,7 +1843,7 @@ def _build_operator_prompt(user_text: str) -> str:
     if chatlog:
         parts.append(chatlog)
 
-    context = _recent_context(max_chars=4000)
+    context = _recent_context(workspace, max_chars=4000)
     if context:
         parts.append(f"## Recent activity\n{context}")
     parts.append(f"## Operator message\n{user_text}")
@@ -1813,14 +1889,13 @@ def _format_tool_activity(tool_name: str, tool_input: dict) -> str:
     return f"{label}..."
 
 
-def run_agent_streaming(bot, prompt: str, chat_id: int) -> str:
-    """Run Claude Code CLI and stream output into a Telegram message."""
+def run_agent_streaming(channel_id: int, msg_id: int, prompt: str) -> str:
+    """Run Claude Code CLI and stream output by editing a Discord message."""
     if PROVIDER == "openrouter":
         cmd = _claude_cmd(prompt)
     else:
         cmd = _claude_cmd(prompt, extra_flags=["--model", "bot"])
 
-    msg = bot.send_message(chat_id, "thinking...")
     current_text = ""
     activity_status = ""
     last_edit = 0.0
@@ -1830,15 +1905,12 @@ def run_agent_streaming(bot, prompt: str, chat_id: int) -> str:
         now = time.time()
         if not force and now - last_edit < 1.5:
             return
-        display = text[-3800:] if len(text) > 3800 else text
+        display = text[-1900:] if len(text) > 1900 else text
         display = _redact_secrets(display)
         if not display.strip():
             return
-        try:
-            bot.edit_message_text(display, chat_id, msg.message_id)
-            last_edit = now
-        except Exception:
-            pass
+        _edit_discord_text(channel_id, msg_id, display)
+        last_edit = now
 
     def _on_text(text: str):
         nonlocal current_text
@@ -1878,360 +1950,360 @@ def run_agent_streaming(bot, prompt: str, chat_id: int) -> str:
         _edit(current_text, force=True)
 
         if not current_text.strip():
-            try:
-                bot.edit_message_text("(no output)", chat_id, msg.message_id)
-            except Exception:
-                pass
+            _edit_discord_text(channel_id, msg_id, "(no output)")
 
     except Exception as e:
-        try:
-            bot.edit_message_text(f"Error: {str(e)[:300]}", chat_id, msg.message_id)
-        except Exception:
-            pass
+        _edit_discord_text(channel_id, msg_id, f"Error: {str(e)[:300]}")
     finally:
         _claude_semaphore.release()
 
     return current_text
 
 
-def _is_owner(user_id: int) -> bool:
-    owner = os.environ.get("TELEGRAM_OWNER_ID", "").strip()
-    if not owner:
-        return False
-    return str(user_id) == owner
-
-
-def _enroll_owner(user_id: int):
-    """Auto-enroll the first /start user as the owner and persist."""
-    owner_id = str(user_id)
-    os.environ["TELEGRAM_OWNER_ID"] = owner_id
-    env_path = WORKING_DIR / ".env"
-    if env_path.exists():
-        existing = env_path.read_text()
-        if "TELEGRAM_OWNER_ID" not in existing:
-            with open(env_path, "a") as f:
-                f.write(f"\nTELEGRAM_OWNER_ID='{owner_id}'\n")
-    elif ENV_ENC_FILE.exists():
-        _save_to_encrypted_env("TELEGRAM_OWNER_ID", owner_id)
-    _log(f"enrolled owner: {owner_id}")
+# ── Discord bot ──────────────────────────────────────────────────────────────
 
 
 def run_bot():
-    """Run the Telegram bot."""
-    token = os.getenv("TAU_BOT_TOKEN")
-    if not token:
-        _log("TAU_BOT_TOKEN not set; add it to .env and restart")
+    """Run the Discord bot with slash commands and message handlers."""
+    global _discord_client, _discord_loop
+    import discord
+    from discord import app_commands
+
+    if not DISCORD_BOT_TOKEN:
+        _log("DISCORD_BOT_TOKEN not set; add it to .env and restart")
+        sys.exit(1)
+    if not DISCORD_GUILD_ID:
+        _log("DISCORD_GUILD_ID not set; add it to .env and restart")
         sys.exit(1)
 
-    import telebot
-    bot = telebot.TeleBot(token)
+    intents = discord.Intents.default()
+    intents.message_content = True
+    intents.guilds = True
+    intents.members = True
 
-    def _save_chat_id(chat_id: int):
-        CHAT_ID_FILE.write_text(str(chat_id))
+    guild_obj = discord.Object(id=DISCORD_GUILD_ID)
 
-    def _reject(message):
-        uid = message.from_user.id if message.from_user else None
-        _log(f"rejected message from unauthorized user {uid}")
-        if not os.environ.get("TELEGRAM_OWNER_ID", "").strip():
-            bot.send_message(message.chat.id, "Send /start to register as the owner.")
-        else:
-            bot.send_message(message.chat.id, "Unauthorized.")
+    class ArbosBot(discord.Client):
+        def __init__(self):
+            super().__init__(intents=intents)
+            self.tree = app_commands.CommandTree(self)
 
-    @bot.message_handler(commands=["start"])
-    def handle_start(message):
-        uid = message.from_user.id if message.from_user else None
-        if not os.environ.get("TELEGRAM_OWNER_ID", "").strip() and uid is not None:
-            _enroll_owner(uid)
-        if not _is_owner(uid):
-            _reject(message)
+        async def setup_hook(self):
+            self.tree.copy_global_to(guild=guild_obj)
+            await self.tree.sync(guild=guild_obj)
+            _log("discord slash commands synced")
+
+        async def on_ready(self):
+            _log(f"discord bot ready as {self.user} (guild={DISCORD_GUILD_ID})")
+            guild = self.get_guild(DISCORD_GUILD_ID)
+            if guild:
+                for ch in guild.text_channels:
+                    if ch.name == "general":
+                        await ch.send("Restarted.")
+                        break
+
+        async def on_message(self, message: discord.Message):
+            if message.author == self.user or message.author.bot:
+                return
+            if not message.guild or message.guild.id != DISCORD_GUILD_ID:
+                return
+            if message.content.startswith("/"):
+                return
+
+            is_thread = isinstance(message.channel, discord.Thread)
+            if is_thread:
+                workspace = message.channel.parent_id
+                thread_id = message.channel.id
+            else:
+                workspace = message.channel.id
+                thread_id = 0
+
+            user_text = message.content or ""
+
+            if message.attachments:
+                for att in message.attachments:
+                    saved = _download_discord_attachment(att.url, att.filename, workspace)
+                    size_kb = att.size / 1024 if att.size else saved.stat().st_size / 1024
+                    att_info = f"\n[Sent file: {saved.name}] saved to {saved} ({size_kb:.1f} KB)"
+                    is_text_file = False
+                    try:
+                        content = saved.read_text(errors="strict")
+                        if len(content) <= 8000:
+                            att_info += f"\n[File contents]:\n{content}"
+                            is_text_file = True
+                    except (UnicodeDecodeError, ValueError):
+                        pass
+                    if not is_text_file:
+                        att_info += "\n(Binary file -- not included inline. Read it from the saved path if needed.)"
+                    user_text += att_info
+
+            if not user_text.strip():
+                return
+
+            log_chat(workspace, "user", user_text[:1000])
+            prompt = _build_operator_prompt(workspace, user_text, thread_id=thread_id)
+
+            thinking_msg = await message.channel.send("thinking...")
+
+            async def _run():
+                response = run_agent_streaming(message.channel.id, thinking_msg.id, prompt)
+                log_chat(workspace, "bot", response[:1000])
+                _process_pending_env()
+
+            await asyncio.to_thread(lambda: _run_sync(_run))
+
+    def _run_sync(coro_fn):
+        """Run an async function synchronously using the bot's event loop."""
+        future = asyncio.run_coroutine_threadsafe(coro_fn(), _discord_loop)
+        future.result()
+
+    bot = ArbosBot()
+
+    # ── Slash commands ───────────────────────────────────────────────────────
+
+    @bot.tree.command(name="thread", description="Create a new goal thread", guild=guild_obj)
+    @app_commands.describe(name="Thread name", message="Goal description")
+    async def cmd_thread(interaction: discord.Interaction, name: str, message: str):
+        if not isinstance(interaction.channel, discord.TextChannel):
+            await interaction.response.send_message("Use /thread in a text channel, not inside a thread.", ephemeral=True)
             return
-        _save_chat_id(message.chat.id)
-        args = (message.text or "").split()
-        if len(args) < 2:
-            bot.send_message(
-                message.chat.id,
-                "Use /goal <text> to create a goal, then /start <index> to begin.\n"
-                "Commands: /ls /goal /start /pause /delete /delay /status /stop /clear",
-            )
-            return
-        try:
-            idx = int(args[1])
-        except ValueError:
-            bot.send_message(message.chat.id, "Usage: /start <goal_index>")
-            return
+
+        await interaction.response.defer()
+        workspace = interaction.channel.id
+
+        thread = await interaction.channel.create_thread(
+            name=name, type=discord.ChannelType.public_thread,
+        )
+        thread_id = thread.id
+
+        summary = await asyncio.to_thread(_summarize_goal, message)
+
         with _goals_lock:
-            gs = _goals.get(idx)
+            ws = _workspaces.setdefault(workspace, {})
+            gs = GoalState(
+                thread_id=thread_id, workspace=workspace,
+                thread_name=name, summary=summary, started=True,
+            )
+            ws[thread_id] = gs
+            gdir = _goal_dir(workspace, thread_id)
+            gdir.mkdir(parents=True, exist_ok=True)
+            _goal_file(workspace, thread_id).write_text(message)
+            _state_file(workspace, thread_id).write_text("")
+            _inbox_file(workspace, thread_id).write_text("")
+            _goal_runs_dir(workspace, thread_id).mkdir(parents=True, exist_ok=True)
+            _save_goals(workspace)
+
+        await thread.send(f"**Goal created**: {summary}\n\n{message}")
+        await interaction.followup.send(f"Thread **{name}** created and started: {summary}")
+        _log(f"goal created ws={workspace} t={thread_id}: {summary}")
+
+    @bot.tree.command(name="start", description="Start/resume this thread's goal", guild=guild_obj)
+    async def cmd_start(interaction: discord.Interaction):
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message("Use /start inside a goal thread.", ephemeral=True)
+            return
+        thread_id = interaction.channel.id
+        workspace = interaction.channel.parent_id
+        with _goals_lock:
+            ws = _workspaces.get(workspace, {})
+            gs = ws.get(thread_id)
             if not gs:
-                bot.send_message(message.chat.id, f"Goal #{idx} not found.")
+                await interaction.response.send_message("No goal found for this thread.", ephemeral=True)
                 return
             gs.started = True
             gs.paused = False
             gs.wake.set()
-            _save_goals()
-        bot.send_message(message.chat.id, f"Goal #{idx} started: {gs.summary}")
-        _log(f"goal #{idx} started via /start")
+            _save_goals(workspace)
+        await interaction.response.send_message(f"Goal started: {gs.summary}")
+        _log(f"goal started ws={workspace} t={thread_id}")
 
-    @bot.message_handler(commands=["ls"])
-    def handle_ls(message):
-        uid = message.from_user.id if message.from_user else None
-        if not _is_owner(uid):
-            _reject(message)
+    @bot.tree.command(name="pause", description="Pause this thread's goal", guild=guild_obj)
+    async def cmd_pause(interaction: discord.Interaction):
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message("Use /pause inside a goal thread.", ephemeral=True)
             return
-        if not _goals:
-            bot.send_message(message.chat.id, "No goals. Use /goal <text> to create one.")
+        thread_id = interaction.channel.id
+        workspace = interaction.channel.parent_id
+        with _goals_lock:
+            ws = _workspaces.get(workspace, {})
+            gs = ws.get(thread_id)
+            if not gs:
+                await interaction.response.send_message("No goal found for this thread.", ephemeral=True)
+                return
+            if gs.paused:
+                await interaction.response.send_message("Already paused.", ephemeral=True)
+                return
+            gs.paused = True
+            _save_goals(workspace)
+        await interaction.response.send_message(f"Goal paused. Use /start to resume.")
+        _log(f"goal paused ws={workspace} t={thread_id}")
+
+    @bot.tree.command(name="delay", description="Set step delay for this thread's goal", guild=guild_obj)
+    @app_commands.describe(seconds="Delay between steps in seconds")
+    async def cmd_delay(interaction: discord.Interaction, seconds: int):
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message("Use /delay inside a goal thread.", ephemeral=True)
+            return
+        if seconds < 0:
+            await interaction.response.send_message("Delay must be >= 0.", ephemeral=True)
+            return
+        thread_id = interaction.channel.id
+        workspace = interaction.channel.parent_id
+        with _goals_lock:
+            ws = _workspaces.get(workspace, {})
+            gs = ws.get(thread_id)
+            if not gs:
+                await interaction.response.send_message("No goal found for this thread.", ephemeral=True)
+                return
+            gs.delay = seconds
+            _save_goals(workspace)
+        await interaction.response.send_message(f"Delay set to {seconds}s.")
+        _log(f"goal delay set ws={workspace} t={thread_id} delay={seconds}s")
+
+    @bot.tree.command(name="ls", description="List all goals in this channel", guild=guild_obj)
+    async def cmd_ls(interaction: discord.Interaction):
+        if isinstance(interaction.channel, discord.Thread):
+            workspace = interaction.channel.parent_id
+        else:
+            workspace = interaction.channel.id
+        ws = _workspaces.get(workspace, {})
+        if not ws:
+            await interaction.response.send_message("No goals. Use /thread to create one.")
             return
         lines = []
-        for idx in sorted(_goals.keys()):
-            gs = _goals[idx]
+        for tid in sorted(ws.keys()):
+            gs = ws[tid]
             status = _goal_status_label(gs)
             last = _format_last_time(gs.last_finished)
             delay_str = f" delay:{gs.delay}s" if gs.delay else ""
-            lines.append(f"#{idx} [{status}]{delay_str} last:{last} - {gs.summary}")
-        bot.send_message(message.chat.id, "\n".join(lines))
+            lines.append(f"**{gs.thread_name}** [{status}]{delay_str} last:{last} - {gs.summary}")
+        await interaction.response.send_message("\n".join(lines))
 
-    @bot.message_handler(commands=["status"])
-    def handle_status(message):
-        uid = message.from_user.id if message.from_user else None
-        if not _is_owner(uid):
-            _reject(message)
-            return
-        args = (message.text or "").split()
-        if len(args) >= 2:
-            try:
-                idx = int(args[1])
-            except ValueError:
-                bot.send_message(message.chat.id, "Usage: /status [goal_index]")
-                return
-            gs = _goals.get(idx)
+    @bot.tree.command(name="status", description="Show workspace or goal status", guild=guild_obj)
+    async def cmd_status(interaction: discord.Interaction):
+        is_thread = isinstance(interaction.channel, discord.Thread)
+        if is_thread:
+            workspace = interaction.channel.parent_id
+            thread_id = interaction.channel.id
+            ws = _workspaces.get(workspace, {})
+            gs = ws.get(thread_id)
             if not gs:
-                bot.send_message(message.chat.id, f"Goal #{idx} not found.")
+                await interaction.response.send_message("No goal found for this thread.", ephemeral=True)
                 return
             status = _goal_status_label(gs)
-            gf = _goal_file(idx)
+            gf = _goal_file(workspace, thread_id)
             goal_text = gf.read_text().strip()[:500] if gf.exists() else "(empty)"
-            sf = _state_file(idx)
+            sf = _state_file(workspace, thread_id)
             state_text = sf.read_text().strip()[:500] if sf.exists() else "(empty)"
             lines = [
-                f"Goal #{idx} [{status}] (delay: {gs.delay}s, step {gs.step_count})",
+                f"**{gs.thread_name}** [{status}] (delay: {gs.delay}s, step {gs.step_count})",
                 f"Last run: {gs.last_run or 'never'}",
                 f"Last finished: {gs.last_finished or 'never'}",
                 "",
-                f"Goal: {goal_text}",
+                f"**Goal:** {goal_text}",
                 "",
-                f"State: {state_text}",
+                f"**State:** {state_text}",
             ]
-            bot.send_message(message.chat.id, "\n".join(lines))
+            await interaction.response.send_message("\n".join(lines))
         else:
-            if not _goals:
-                bot.send_message(message.chat.id, f"No goals. Total steps: {_step_count}")
+            workspace = interaction.channel.id
+            ws = _workspaces.get(workspace, {})
+            if not ws:
+                await interaction.response.send_message(f"No goals. Total steps: {_step_count}")
                 return
             lines = [f"Total steps: {_step_count}"]
-            for idx in sorted(_goals.keys()):
-                gs = _goals[idx]
+            for tid in sorted(ws.keys()):
+                gs = ws[tid]
                 status = _goal_status_label(gs)
                 last = _format_last_time(gs.last_finished)
                 delay_str = f" delay:{gs.delay}s" if gs.delay else ""
-                lines.append(f"#{idx} [{status}]{delay_str} last:{last} - {gs.summary}")
-            bot.send_message(message.chat.id, "\n".join(lines))
+                lines.append(f"**{gs.thread_name}** [{status}]{delay_str} last:{last} - {gs.summary}")
+            await interaction.response.send_message("\n".join(lines))
 
-    @bot.message_handler(commands=["stop"])
-    def handle_stop(message):
-        uid = message.from_user.id if message.from_user else None
-        if not _is_owner(uid):
-            _reject(message)
-            return
+    @bot.tree.command(name="stop", description="Stop all goals in this channel", guild=guild_obj)
+    async def cmd_stop(interaction: discord.Interaction):
+        if isinstance(interaction.channel, discord.Thread):
+            workspace = interaction.channel.parent_id
+        else:
+            workspace = interaction.channel.id
         with _goals_lock:
+            ws = _workspaces.get(workspace, {})
             count = 0
-            for gs in _goals.values():
+            for gs in ws.values():
                 if gs.started:
                     gs.started = False
                     gs.stop_event.set()
                     gs.wake.set()
                     count += 1
-            _save_goals()
-        bot.send_message(message.chat.id, f"Stopped {count} goal(s).")
-        _log(f"all goals stopped via /stop ({count})")
+            _save_goals(workspace)
+        await interaction.response.send_message(f"Stopped {count} goal(s).")
+        _log(f"all goals stopped in ws={workspace} ({count})")
 
-    @bot.message_handler(commands=["pause"])
-    def handle_pause(message):
-        uid = message.from_user.id if message.from_user else None
-        if not _is_owner(uid):
-            _reject(message)
+    @bot.tree.command(name="delete", description="Delete this thread's goal", guild=guild_obj)
+    async def cmd_delete(interaction: discord.Interaction):
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message("Use /delete inside a goal thread.", ephemeral=True)
             return
-        args = (message.text or "").split()
-        if len(args) < 2:
-            bot.send_message(message.chat.id, "Usage: /pause <goal_index>")
-            return
-        try:
-            idx = int(args[1])
-        except ValueError:
-            bot.send_message(message.chat.id, "Usage: /pause <goal_index>")
-            return
+        thread_id = interaction.channel.id
+        workspace = interaction.channel.parent_id
         with _goals_lock:
-            gs = _goals.get(idx)
+            ws = _workspaces.get(workspace, {})
+            gs = ws.get(thread_id)
             if not gs:
-                bot.send_message(message.chat.id, f"Goal #{idx} not found.")
-                return
-            if gs.paused:
-                bot.send_message(message.chat.id, f"Goal #{idx} already paused.")
-                return
-            gs.paused = True
-            _save_goals()
-        bot.send_message(message.chat.id, f"Goal #{idx} paused. Use /start {idx} to resume.")
-        _log(f"goal #{idx} paused via /pause")
-
-    @bot.message_handler(commands=["delay"])
-    def handle_delay(message):
-        uid = message.from_user.id if message.from_user else None
-        if not _is_owner(uid):
-            _reject(message)
-            return
-        args = (message.text or "").split()
-        if len(args) < 3:
-            bot.send_message(message.chat.id, "Usage: /delay <goal_index> <seconds>")
-            return
-        try:
-            idx = int(args[1])
-            seconds = int(args[2])
-        except ValueError:
-            bot.send_message(message.chat.id, "Usage: /delay <goal_index> <seconds>")
-            return
-        if seconds < 0:
-            bot.send_message(message.chat.id, "Delay must be >= 0.")
-            return
-        with _goals_lock:
-            gs = _goals.get(idx)
-            if not gs:
-                bot.send_message(message.chat.id, f"Goal #{idx} not found.")
-                return
-            gs.delay = seconds
-            _save_goals()
-        bot.send_message(message.chat.id, f"Goal #{idx} delay set to {seconds}s.")
-        _log(f"goal #{idx} delay set to {seconds}s via /delay")
-
-    @bot.message_handler(commands=["goal"])
-    def handle_goal(message):
-        uid = message.from_user.id if message.from_user else None
-        if not _is_owner(uid):
-            _reject(message)
-            return
-        text = (message.text or "").split(None, 1)
-        if len(text) < 2 or not text[1].strip():
-            bot.send_message(message.chat.id, "Usage: /goal <your goal text>")
-            return
-        goal_text = text[1].strip()
-        msg = bot.send_message(message.chat.id, "Creating goal...")
-        summary = _summarize_goal(goal_text)
-        with _goals_lock:
-            idx = max(_goals.keys(), default=0) + 1
-            gs = GoalState(index=idx, summary=summary)
-            _goals[idx] = gs
-            gdir = _goal_dir(idx)
-            gdir.mkdir(parents=True, exist_ok=True)
-            _goal_file(idx).write_text(goal_text)
-            _state_file(idx).write_text("")
-            _inbox_file(idx).write_text("")
-            _goal_runs_dir(idx).mkdir(parents=True, exist_ok=True)
-            _save_goals()
-        bot.edit_message_text(
-            f"Goal #{idx} created: {summary}\nUse /start {idx} to begin.",
-            message.chat.id, msg.message_id,
-        )
-        _log(f"goal #{idx} created ({len(goal_text)} chars): {summary}")
-
-    @bot.message_handler(commands=["delete"])
-    def handle_delete(message):
-        uid = message.from_user.id if message.from_user else None
-        if not _is_owner(uid):
-            _reject(message)
-            return
-        args = (message.text or "").split()
-        if len(args) < 2:
-            bot.send_message(message.chat.id, "Usage: /delete <goal_index>")
-            return
-        try:
-            idx = int(args[1])
-        except ValueError:
-            bot.send_message(message.chat.id, "Usage: /delete <goal_index>")
-            return
-        with _goals_lock:
-            gs = _goals.get(idx)
-            if not gs:
-                bot.send_message(message.chat.id, f"Goal #{idx} not found.")
+                await interaction.response.send_message("No goal found for this thread.", ephemeral=True)
                 return
             gs.stop_event.set()
             gs.wake.set()
             gs.started = False
-            thread = gs.thread
-            del _goals[idx]
-            _save_goals()
-        if thread and thread.is_alive():
-            thread.join(timeout=5)
+            bg_thread = gs.thread
+            del ws[thread_id]
+            _save_goals(workspace)
+        if bg_thread and bg_thread.is_alive():
+            bg_thread.join(timeout=5)
         import shutil
-        gdir = _goal_dir(idx)
+        gdir = _goal_dir(workspace, thread_id)
         if gdir.exists():
             shutil.rmtree(gdir, ignore_errors=True)
-        bot.send_message(message.chat.id, f"Goal #{idx} deleted.")
-        _log(f"goal #{idx} deleted via /delete")
+        await interaction.response.send_message(f"Goal deleted.")
+        try:
+            await interaction.channel.edit(archived=True)
+        except Exception:
+            pass
+        _log(f"goal deleted ws={workspace} t={thread_id}")
 
-    @bot.message_handler(commands=["clear"])
-    def handle_clear(message):
-        uid = message.from_user.id if message.from_user else None
-        if not _is_owner(uid):
-            _reject(message)
+    @bot.tree.command(name="clear", description="Clear all goals in this channel", guild=guild_obj)
+    async def cmd_clear(interaction: discord.Interaction):
+        if isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message("Use /clear in a channel, not a thread.", ephemeral=True)
             return
+        workspace = interaction.channel.id
         import shutil
         with _goals_lock:
-            for gs in _goals.values():
+            ws = _workspaces.get(workspace, {})
+            for gs in ws.values():
                 gs.stop_event.set()
                 gs.wake.set()
-            _goals.clear()
+            ws.clear()
+        ws_dir = _workspace_dir(workspace)
         removed = []
-        if CONTEXT_DIR.exists():
-            shutil.rmtree(CONTEXT_DIR)
-            removed.append("context/")
-        try:
-            r = subprocess.run(
-                ["git", "checkout", "HEAD", "--", "."],
-                cwd=WORKING_DIR, capture_output=True, text=True, timeout=10,
-            )
-            if r.returncode == 0:
-                removed.append("git checkout (restored tracked files)")
-        except Exception:
-            pass
-        try:
-            r = subprocess.run(
-                ["git", "clean", "-fd", "--exclude=.env*", "--exclude=chat_id.txt",
-                 "--exclude=.venv", "--exclude=__pycache__", "--exclude=.claude"],
-                cwd=WORKING_DIR, capture_output=True, text=True, timeout=10,
-            )
-            if r.returncode == 0 and r.stdout.strip():
-                removed.append(f"git clean ({len(r.stdout.splitlines())} items)")
-        except Exception:
-            pass
-        CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+        if ws_dir.exists():
+            shutil.rmtree(ws_dir)
+            removed.append(f"workspace {workspace}")
+        ws_dir.mkdir(parents=True, exist_ok=True)
         summary = ", ".join(removed) if removed else "nothing to clear"
-        bot.send_message(message.chat.id, f"Cleared: {summary}\nReady for a fresh /goal.")
-        _log(f"cleared via /clear command: {summary}")
+        await interaction.response.send_message(f"Cleared: {summary}\nReady for a fresh /thread.")
+        _log(f"cleared workspace ws={workspace}: {summary}")
 
-    @bot.message_handler(commands=["restart"])
-    def handle_restart(message):
-        uid = message.from_user.id if message.from_user else None
-        if not _is_owner(uid):
-            _reject(message)
-            return
-        bot.send_message(message.chat.id, "Restarting — killing agent and exiting for pm2...")
+    @bot.tree.command(name="restart", description="Restart arbos (pm2)", guild=guild_obj)
+    async def cmd_restart(interaction: discord.Interaction):
+        await interaction.response.send_message("Restarting -- killing agent and exiting for pm2...")
         _log("restart requested via /restart command")
         _kill_child_procs()
         RESTART_FLAG.touch()
 
-    @bot.message_handler(commands=["update"])
-    def handle_update(message):
-        uid = message.from_user.id if message.from_user else None
-        if not _is_owner(uid):
-            _reject(message)
-            return
-        msg = bot.send_message(message.chat.id, "Pulling latest changes...")
+    @bot.tree.command(name="update", description="Git pull and restart", guild=guild_obj)
+    async def cmd_update(interaction: discord.Interaction):
+        await interaction.response.defer()
         try:
             r = subprocess.run(
                 ["git", "pull", "--ff-only"],
@@ -2239,147 +2311,53 @@ def run_bot():
             )
             output = (r.stdout.strip() + "\n" + r.stderr.strip()).strip()
             if r.returncode != 0:
-                bot.edit_message_text(f"Git pull failed:\n{output[:3800]}", message.chat.id, msg.message_id)
+                await interaction.followup.send(f"Git pull failed:\n{output[:1900]}")
                 _log(f"update failed: {output[:200]}")
                 return
-            bot.edit_message_text(f"Pulled:\n{output[:3800]}\n\nRestarting...", message.chat.id, msg.message_id)
+            await interaction.followup.send(f"Pulled:\n{output[:1900]}\n\nRestarting...")
             _log(f"update pulled: {output[:200]}")
         except Exception as exc:
-            bot.edit_message_text(f"Git pull error: {str(exc)[:3800]}", message.chat.id, msg.message_id)
+            await interaction.followup.send(f"Git pull error: {str(exc)[:1900]}")
             _log(f"update error: {str(exc)[:200]}")
             return
         _kill_child_procs()
         RESTART_FLAG.touch()
 
-    @bot.message_handler(content_types=["voice", "audio"])
-    def handle_voice(message):
-        uid = message.from_user.id if message.from_user else None
-        if not _is_owner(uid):
-            _reject(message)
-            return
-        _save_chat_id(message.chat.id)
-        bot.send_message(message.chat.id, "Transcribing voice note...")
+    @bot.tree.command(name="help", description="Show available commands", guild=guild_obj)
+    async def cmd_help(interaction: discord.Interaction):
+        help_text = """**Available Commands:**
 
-        voice_or_audio = message.voice or message.audio
-        file_info = bot.get_file(voice_or_audio.file_id)
-        downloaded = bot.download_file(file_info.file_path)
+• `/thread` - Create a new goal thread
+• `/start` - Start/resume this thread's goal
+• `/pause` - Pause this thread's goal
+• `/stop` - Stop all goals in this channel
+• `/status` - Show workspace or goal status
+• `/ls` - List all goals in this channel
+• `/delay` - Set step delay for this thread's goal
+• `/delete` - Delete this thread's goal
+• `/clear` - Clear all goals in this channel
+• `/restart` - Restart arbos (pm2)
+• `/update` - Git pull and restart
+• `/help` - Show this help message"""
+        await interaction.response.send_message(help_text)
 
-        ext = file_info.file_path.rsplit(".", 1)[-1] if "." in file_info.file_path else "ogg"
-        tmp_path = WORKING_DIR / f"_voice_tmp.{ext}"
-        tmp_path.write_bytes(downloaded)
+    # ── Start bot ────────────────────────────────────────────────────────────
 
-        try:
-            transcript = transcribe_voice(str(tmp_path), fmt=ext)
-        finally:
-            tmp_path.unlink(missing_ok=True)
+    _discord_client = bot
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _discord_loop = loop
 
-        caption = message.caption or ""
-        user_text = f"[Voice note transcription]: {transcript}"
-        if caption:
-            user_text += f"\n[Caption]: {caption}"
+    async def runner():
+        async with bot:
+            await bot.start(DISCORD_BOT_TOKEN)
 
-        log_chat("user", user_text[:1000])
-        prompt = _build_operator_prompt(user_text)
-
-        def _run():
-            response = run_agent_streaming(bot, prompt, message.chat.id)
-            log_chat("bot", response[:1000])
-            _process_pending_env()
-
-        threading.Thread(target=_run, daemon=True).start()
-
-    @bot.message_handler(content_types=["document"])
-    def handle_document(message):
-        uid = message.from_user.id if message.from_user else None
-        if not _is_owner(uid):
-            _reject(message)
-            return
-        _save_chat_id(message.chat.id)
-
-        doc = message.document
-        filename = doc.file_name or f"file_{doc.file_id[:8]}"
-        saved_path = _download_telegram_file(bot, doc.file_id, filename)
-
-        caption = message.caption or ""
-        size_kb = doc.file_size / 1024 if doc.file_size else saved_path.stat().st_size / 1024
-        user_text = f"[Sent file: {saved_path.name}] saved to {saved_path} ({size_kb:.1f} KB)"
-        if caption:
-            user_text += f"\n[Caption]: {caption}"
-
-        is_text = False
-        try:
-            content = saved_path.read_text(errors="strict")
-            if len(content) <= 8000:
-                user_text += f"\n[File contents]:\n{content}"
-                is_text = True
-        except (UnicodeDecodeError, ValueError):
-            pass
-
-        if not is_text:
-            user_text += "\n(Binary file — not included inline. Read it from the saved path if needed.)"
-
-        log_chat("user", user_text[:1000])
-        prompt = _build_operator_prompt(user_text)
-
-        def _run():
-            response = run_agent_streaming(bot, prompt, message.chat.id)
-            log_chat("bot", response[:1000])
-            _process_pending_env()
-
-        threading.Thread(target=_run, daemon=True).start()
-
-    @bot.message_handler(content_types=["photo"])
-    def handle_photo(message):
-        uid = message.from_user.id if message.from_user else None
-        if not _is_owner(uid):
-            _reject(message)
-            return
-        _save_chat_id(message.chat.id)
-
-        photo = message.photo[-1]  # highest resolution
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"photo_{ts}.jpg"
-        saved_path = _download_telegram_file(bot, photo.file_id, filename)
-
-        caption = message.caption or ""
-        user_text = f"[Sent photo: {saved_path.name}] saved to {saved_path}"
-        if caption:
-            user_text += f"\n[Caption]: {caption}"
-
-        log_chat("user", user_text[:1000])
-        prompt = _build_operator_prompt(user_text)
-
-        def _run():
-            response = run_agent_streaming(bot, prompt, message.chat.id)
-            log_chat("bot", response[:1000])
-            _process_pending_env()
-
-        threading.Thread(target=_run, daemon=True).start()
-
-    @bot.message_handler(func=lambda m: True)
-    def handle_message(message):
-        uid = message.from_user.id if message.from_user else None
-        if not _is_owner(uid):
-            _reject(message)
-            return
-        _save_chat_id(message.chat.id)
-        log_chat("user", message.text)
-        prompt = _build_operator_prompt(message.text)
-
-        def _run():
-            response = run_agent_streaming(bot, prompt, message.chat.id)
-            log_chat("bot", response[:1000])
-            _process_pending_env()
-
-        threading.Thread(target=_run, daemon=True).start()
-
-    _log("telegram bot started")
-    while True:
-        try:
-            bot.infinity_polling()
-        except Exception as e:
-            _log(f"bot polling error: {str(e)[:80]}, reconnecting in 5s")
-            time.sleep(5)
+    try:
+        loop.run_until_complete(runner())
+    except Exception as exc:
+        _log(f"discord bot error: {str(exc)[:200]}")
+    finally:
+        loop.close()
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -2425,12 +2403,12 @@ def _kill_stale_claude_procs():
 def _send_cli(args: list[str]):
     """CLI entry point: python arbos.py send 'message' [--file path]
 
-    Within a step, all sends are consolidated into a single Telegram message.
+    Within a step, all sends are consolidated into a single Discord message.
     The first send creates it; subsequent sends edit it by appending.
-    Uses ARBOS_GOAL_INDEX env var to find the per-goal step message file.
+    Uses ARBOS_WORKSPACE/ARBOS_THREAD_ID env vars to find the per-goal step message file.
     """
     import argparse
-    parser = argparse.ArgumentParser(description="Send a Telegram message to the operator")
+    parser = argparse.ArgumentParser(description="Send a Discord message to the operator")
     parser.add_argument("message", nargs="?", help="Message text to send")
     parser.add_argument("--file", help="Send contents of a file instead")
     parsed = parser.parse_args(args)
@@ -2443,58 +2421,63 @@ def _send_cli(args: list[str]):
     else:
         text = parsed.message
 
-    goal_index = int(os.environ.get("ARBOS_GOAL_INDEX", "0"))
-    if goal_index:
-        smf = _step_msg_file(goal_index)
-    else:
-        smf = CONTEXT_DIR / ".step_msg"
+    workspace = int(os.environ.get("ARBOS_WORKSPACE", "0"))
+    thread_id = int(os.environ.get("ARBOS_THREAD_ID", "0"))
+
+    if not workspace or not thread_id:
+        print("ARBOS_WORKSPACE and ARBOS_THREAD_ID must be set", file=sys.stderr)
+        sys.exit(1)
+
+    smf = _step_msg_file(workspace, thread_id)
     smf.parent.mkdir(parents=True, exist_ok=True)
 
     if smf.exists():
         try:
             state = json.loads(smf.read_text())
-            msg_id = state["msg_id"]
+            msg_id = int(state["msg_id"])
+            channel_id = int(state.get("channel_id", thread_id))
             prev_text = state.get("text", "")
         except (json.JSONDecodeError, KeyError):
             msg_id = None
+            channel_id = thread_id
             prev_text = ""
     else:
         msg_id = None
+        channel_id = thread_id
         prev_text = ""
 
     if msg_id:
         combined = (prev_text + "\n\n" + text).strip()
-        if _edit_telegram_text(msg_id, combined):
-            smf.write_text(json.dumps({"msg_id": msg_id, "text": combined}))
-            log_chat("bot", combined[:1000])
+        if _discord_rest_edit(channel_id, msg_id, combined):
+            smf.write_text(json.dumps({"msg_id": msg_id, "channel_id": channel_id, "text": combined}))
+            log_chat(workspace, "bot", combined[:1000])
             print(f"Edited step message ({len(combined)} chars)")
         else:
-            new_id = _send_telegram_new(text)
+            new_id = _discord_rest_send(channel_id, text)
             if new_id:
-                smf.write_text(json.dumps({"msg_id": new_id, "text": text}))
-                log_chat("bot", text[:1000])
+                smf.write_text(json.dumps({"msg_id": new_id, "channel_id": channel_id, "text": text}))
+                log_chat(workspace, "bot", text[:1000])
                 print(f"Sent new message ({len(text)} chars)")
             else:
                 print("Failed to send", file=sys.stderr)
                 sys.exit(1)
     else:
-        new_id = _send_telegram_new(text)
+        new_id = _discord_rest_send(channel_id, text)
         if new_id:
-            smf.write_text(json.dumps({"msg_id": new_id, "text": text}))
-            log_chat("bot", text[:1000])
+            smf.write_text(json.dumps({"msg_id": new_id, "channel_id": channel_id, "text": text}))
+            log_chat(workspace, "bot", text[:1000])
             print(f"Sent ({len(text)} chars)")
         else:
-            print("Failed to send (check TAU_BOT_TOKEN and chat_id.txt)", file=sys.stderr)
+            print("Failed to send (check DISCORD_BOT_TOKEN)", file=sys.stderr)
             sys.exit(1)
 
 
 def _sendfile_cli(args: list[str]):
-    """CLI entry point: python arbos.py sendfile path/to/file [--caption 'text'] [--photo]"""
+    """CLI entry point: python arbos.py sendfile path/to/file [--caption 'text']"""
     import argparse
-    parser = argparse.ArgumentParser(description="Send a file to the operator via Telegram")
+    parser = argparse.ArgumentParser(description="Send a file to the operator via Discord")
     parser.add_argument("path", help="Path to the file to send")
     parser.add_argument("--caption", default="", help="Caption for the file")
-    parser.add_argument("--photo", action="store_true", help="Send as a compressed photo instead of a document")
     parsed = parser.parse_args(args)
 
     file_path = Path(parsed.path)
@@ -2502,15 +2485,16 @@ def _sendfile_cli(args: list[str]):
         print(f"File not found: {file_path}", file=sys.stderr)
         sys.exit(1)
 
-    if parsed.photo:
-        ok = _send_telegram_photo(str(file_path), caption=parsed.caption)
-    else:
-        ok = _send_telegram_document(str(file_path), caption=parsed.caption)
+    thread_id = int(os.environ.get("ARBOS_THREAD_ID", "0"))
+    if not thread_id:
+        print("ARBOS_THREAD_ID must be set", file=sys.stderr)
+        sys.exit(1)
 
+    ok = _discord_rest_send_file(thread_id, str(file_path), caption=parsed.caption)
     if ok:
-        print(f"Sent {'photo' if parsed.photo else 'file'}: {file_path.name}")
+        print(f"Sent file: {file_path.name}")
     else:
-        print("Failed to send (check TAU_BOT_TOKEN and chat_id.txt)", file=sys.stderr)
+        print("Failed to send (check DISCORD_BOT_TOKEN)", file=sys.stderr)
         sys.exit(1)
 
 
@@ -2532,13 +2516,13 @@ def main() -> None:
                 print(".env not found, nothing to encrypt")
             return
         load_dotenv(env_path)
-        bot_token = os.environ.get("TAU_BOT_TOKEN", "")
+        bot_token = os.environ.get("DISCORD_BOT_TOKEN", "")
         if not bot_token:
-            print("TAU_BOT_TOKEN must be set in .env", file=sys.stderr)
+            print("DISCORD_BOT_TOKEN must be set in .env", file=sys.stderr)
             sys.exit(1)
         _encrypt_env_file(bot_token)
-        print("Encrypted .env → .env.enc, deleted plaintext.")
-        print(f"On future starts: TAU_BOT_TOKEN='{bot_token}' python arbos.py")
+        print("Encrypted .env -> .env.enc, deleted plaintext.")
+        print(f"On future starts: DISCORD_BOT_TOKEN='{bot_token}' python arbos.py")
         return
 
     if len(sys.argv) > 1 and sys.argv[1] not in ("send", "encrypt", "sendfile"):
@@ -2550,14 +2534,15 @@ def main() -> None:
     _kill_stale_claude_procs()
     _reload_env_secrets()
     CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
-    GOALS_DIR.mkdir(parents=True, exist_ok=True)
+    WORKSPACES_DIR.mkdir(parents=True, exist_ok=True)
 
-    _load_goals()
-    _log(f"loaded {len(_goals)} goal(s) from goals.json")
+    _load_all_workspaces()
+    total_goals = sum(len(ws) for ws in _workspaces.values())
+    _log(f"loaded {total_goals} goal(s) across {len(_workspaces)} workspace(s)")
 
     if not LLM_API_KEY:
         key_name = "OPENROUTER_API_KEY" if PROVIDER == "openrouter" else "CHUTES_API_KEY"
-        _log(f"WARNING: {key_name} not set — LLM calls will fail")
+        _log(f"WARNING: {key_name} not set -- LLM calls will fail")
 
     def _handle_sigterm(signum, frame):
         _log("SIGTERM received; shutting down gracefully")
@@ -2570,11 +2555,9 @@ def main() -> None:
         threading.Thread(target=_start_proxy, daemon=True).start()
         time.sleep(1)
     else:
-        _log(f"openrouter direct mode — no proxy needed (target={LLM_BASE_URL})")
+        _log(f"openrouter direct mode -- no proxy needed (target={LLM_BASE_URL})")
 
     _write_claude_settings()
-
-    _send_telegram_text("Restarted.")
 
     threading.Thread(target=_goal_manager, daemon=True).start()
     threading.Thread(target=run_bot, daemon=True).start()
